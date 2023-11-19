@@ -8,10 +8,6 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
-# Allowed remote name characters
-allowed_chars="[A-Za-z0-9_-]"
-regexp_str="^$allowed_chars+$"
-
 # Install rclone function
 install_rclone() {
     read -p "Install rclone from the author's website? (y/n) " install
@@ -41,39 +37,31 @@ fi
 
 # Get remote names from rclone config file
 config_path="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+
 if [ -f "$config_path" ]; then
-    remotes=$(grep '\[\w*\]' "$config_path" | tr -d '[]')
+
+  remotes=$(grep '\[.*\]' "$config_path" | tr -d '[]')
+
 else
     echo "Error: Rclone configuration file not found. Run 'rclone config' to create a configuration file."
     exit 1
 fi
 
-# Validate remote names and rename if needed
+# Validate and rename remotes
 for remote in $remotes; do
-  if [[ ! "$remote" =~ $regexp_str ]]; then
-    echo "Invalid remote name: $remote"
-    echo "Allowed characters: $allowed_chars"
-    read -p "Would you like to automatically rename this remote? (y/n) " auto_rename
-    if [ "$auto_rename" == "y" ]; then
 
-      # Remove characters not in the allowed set
-      new_remote=$(echo "$remote" | tr -cd "$allowed_chars")
-      
-      if [ -n "$new_remote" ]; then
-        echo "Automatically renaming the remote to $new_remote"
+  new_remote="${remote//[^A-Za-z0-9_-]/_}"  
 
-        # Replace the old remote name with the new one in the rclone config file
-        sed -i "s/\[$remote\]/\[$new_remote\]/" "$config_path"
+  if [ "$remote" != "$new_remote" ]; then
 
-        # Re-read remotes after renaming
-        remotes=$(grep '\[\w*\]' "$config_path" | tr -d '[]')
-      else
-        echo "Error: The new remote name is empty after auto-renaming. Please manually rename the remote using 'rclone config'."
-      fi
-    else
-      read -p "To manually rename the remote, run 'rclone config', select 'r' to rename, choose the number for the remote, and provide the new name."
-    fi
+    echo "Renaming remote $remote to $new_remote"
+
+    sed -i "s/$remote/$new_remote/" "$config_path"
+    
+    remotes=$(grep '\[\w*\]' "$config_path" | tr -d '[]')
+
   fi
+
 done
 
 # Create systemd unit file
@@ -85,11 +73,11 @@ cat > "$unit_file" <<EOF
 Description=rclone: Remote FUSE filesystem for cloud storage config %i
 Documentation=man:rclone(1)
 After=network-online.target
-Wants=network-online.target 
+Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/bin/bash -c '[[ -d %h/mnt/%i ]] || mkdir -p %h/mnt/%i'
+ExecStartPre=/bin/mkdir -p %h/mnt/%i
 ExecStart=/usr/bin/rclone mount \\
         --vfs-cache-mode full \\
         --vfs-cache-max-size 1G \\
@@ -100,17 +88,18 @@ ExecStart=/usr/bin/rclone mount \\
 ExecStop=/bin/fusermount -u %h/mnt/%i
 Restart=on-failure
 RestartSec=1m
+StandardOutput=syslog
+StandardError=syslog
 
 [Install]
 WantedBy=default.target
 EOF
 
-# Reload systemd units
+# Reload systemd and enable services
 systemctl --user daemon-reload
 
-# Enable and start services for all remotes
 for remote in $remotes; do
-    systemctl --user enable --now "rclone@${remote}"
+  systemctl --user enable --now "rclone@${remote}"
 done
 
 # Display completion message and usage instructions
