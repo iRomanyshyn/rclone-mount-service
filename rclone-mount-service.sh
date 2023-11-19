@@ -10,6 +10,7 @@ fi
 
 # Allowed remote name characters
 allowed_chars="[A-Za-z0-9_-]"
+regexp_str="^$allowed_chars+$"
 
 # Install rclone function
 install_rclone() {
@@ -47,30 +48,33 @@ else
     exit 1
 fi
 
-# Function to sanitize remote name
-sanitize_remote_name() {
-    local dirty_name="$1"
-    echo "$dirty_name" | sed 's/[^A-Za-z0-9_-]/_/g'
-}
-
 # Validate remote names and rename if needed
 for remote in $remotes; do
-  if ! [[ $remote =~ $regex ]]; then
+  if [[ ! "$remote" =~ $regexp_str ]]; then
     echo "Invalid remote name: $remote"
     echo "Allowed characters: $allowed_chars"
     read -p "Would you like to automatically rename this remote? (y/n) " auto_rename
     if [ "$auto_rename" == "y" ]; then
+
+      # Remove characters not in the allowed set
       new_remote=$(echo "$remote" | tr -cd "$allowed_chars")
-      echo "Automatically renaming the remote to $new_remote"
       
-      # Replace the old remote name with the new one in the rclone config file
-      sed -i "s/\[$remote\]/\[$new_remote\]/" "$config_path"
+      if [ -n "$new_remote" ]; then
+        echo "Automatically renaming the remote to $new_remote"
+
+        # Replace the old remote name with the new one in the rclone config file
+        sed -i "s/\[$remote\]/\[$new_remote\]/" "$config_path"
+
+        # Re-read remotes after renaming
+        remotes=$(grep '\[\w*\]' "$config_path" | tr -d '[]')
+      else
+        echo "Error: The new remote name is empty after auto-renaming. Please manually rename the remote using 'rclone config'."
+      fi
     else
       read -p "To manually rename the remote, run 'rclone config', select 'r' to rename, choose the number for the remote, and provide the new name."
     fi
   fi
 done
-
 
 # Create systemd unit file
 unit_file="${HOME}/.config/systemd/user/rclone@.service"
@@ -87,12 +91,12 @@ Wants=network-online.target
 Type=notify
 ExecStartPre=/bin/bash -c '[[ -d %h/mnt/%i ]] || mkdir -p %h/mnt/%i'
 ExecStart=/usr/bin/rclone mount \\
---vfs-cache-mode full \\
---vfs-cache-max-size 1G \\
---log-level INFO \\
---log-file /tmp/rclone-%i.log \\
---umask 077 \\
-%i: %h/mnt/%i
+        --vfs-cache-mode full \\
+        --vfs-cache-max-size 1G \\
+        --log-level INFO \\
+        --log-file /tmp/rclone-%i.log \\
+        --umask 077 \\
+        %i: %h/mnt/%i
 ExecStop=/bin/fusermount -u %h/mnt/%i
 Restart=on-failure
 RestartSec=1m
