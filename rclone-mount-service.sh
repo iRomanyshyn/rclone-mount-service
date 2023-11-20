@@ -88,8 +88,8 @@ ExecStart=/usr/bin/rclone mount \\
 ExecStop=/bin/fusermount -u %h/mnt/%i
 Restart=on-failure
 RestartSec=1m
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target
