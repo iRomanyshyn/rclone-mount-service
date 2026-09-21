@@ -8,8 +8,7 @@ Notable changes to this project are documented here. The format follows
 ### Added
 
 - Explicit single-remote `configure` and remote-to-unit `list` commands.
-- Readable, bounded `rclone@<remote>-<id>.service` names with automatic
-  migration from the previous opaque unit names while retaining cache paths.
+- Readable, bounded `rclone@<remote>-<id>.service` names.
 - Post-stop FUSE verification with normal and lazy-unmount cleanup fallbacks.
 - Per-mount subdirectory, mountpoint, read-only and VFS cache options.
 - Explicit isolated cache directories for every generated service.
