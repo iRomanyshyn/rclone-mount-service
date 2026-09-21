@@ -25,7 +25,7 @@ Contributions and suggestions for portable mount defaults are welcome.
 - Linux with a running systemd user manager.
 - Bash, `sha256sum` and Python 3 for the test suite.
 - FUSE through `/dev/fuse`, plus `fusermount3` or `fusermount` under `/usr/bin`
-  or `/bin`; `mountpoint` and `systemd-escape` from the system utilities.
+  or `/bin`; `findmnt` and `systemd-escape` from the system utilities.
 - Rclone 1.68 or newer, supporting `listremotes --source file`, the VFS queue
   remote-control call and RC Unix sockets.
 - `curl` or `wget` and `sudo` only when the script must install Rclone.
@@ -168,7 +168,9 @@ upstream notes that unmount can fail when a mountpoint is busy. `ExecStopPost`
 therefore checks the mount table after Rclone exits, tries a normal
 `fusermount3 -u`/`fusermount -u`, and finally performs a lazy detach if the
 normal unmount fails. A lazy detach immediately removes the path from the mount
-namespace while the kernel releases any remaining references later.
+namespace while the kernel releases any remaining references later. Every
+generated mount has a unique device name; cleanup refuses to touch a mountpoint
+whose current source does not match it.
 
 If the timeout expires, the network fails or power is lost, Rclone's persistent
 isolated cache is retained. According to the
