@@ -322,6 +322,36 @@ class RemoteTests(unittest.TestCase):
                 [f"--user disable --now {orphan}", "--user daemon-reload"],
             )
 
+    def test_prune_keeps_current_legacy_unit_until_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            config = root / "rclone.conf"
+            config.touch()
+            remote = "current"
+            old_unit = legacy_unit(config, remote)
+            unit_dir = home / ".config/systemd/user"
+            unit_dir.mkdir(parents=True)
+            config_hash = hashlib.sha256(str(config).encode() + b"\0").hexdigest()
+            (unit_dir / old_unit).write_text(
+                "# Managed by rclone-mount-service\n"
+                f"# Config-SHA256={config_hash}\n"
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            systemctl = fake_bin / "systemctl"
+            systemctl.write_text("#!/bin/bash\nexit 99\n")
+            systemctl.chmod(0o755)
+            result = run_bash(
+                'CONFIG_PATH="$1"; AVAILABLE_REMOTES=(current); prune_orphaned_units',
+                args=(str(config),),
+                env={
+                    "HOME": str(home),
+                    "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((unit_dir / old_unit).exists())
+
     def test_legacy_unit_migration_preserves_storage_and_forces_unmount(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
