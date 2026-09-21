@@ -276,11 +276,12 @@ select_remotes() {
                 return 1
                 ;;
         esac
-        if [ "$item" -lt 1 ] || [ "$item" -gt "${#AVAILABLE_REMOTES[@]}" ]; then
+        index=$((10#$item))
+        if [ "$index" -lt 1 ] || [ "$index" -gt "${#AVAILABLE_REMOTES[@]}" ]; then
             echo "Error: Selection out of range: $item" >&2
             return 1
         fi
-        add_selected_remote "${AVAILABLE_REMOTES[item - 1]}" || return 1
+        add_selected_remote "${AVAILABLE_REMOTES[index - 1]}" || return 1
     done
     [ "${#SELECTED_REMOTES[@]}" -gt 0 ] || {
         echo "Error: No remotes selected." >&2
@@ -297,32 +298,50 @@ escape_systemd_exec_value() {
     printf '%s' "$value"
 }
 
+service_unit() {
+    local digest
+    digest=$(printf '%s\0%s\0' "$CONFIG_PATH" "$1" | sha256sum) || return 1
+    digest=${digest%% *}
+    case "$digest" in
+        *[!0-9a-f]*|'')
+            echo "Error: sha256sum returned an invalid digest." >&2
+            return 1
+            ;;
+    esac
+    printf 'rclone-%s.service\n' "${digest:0:24}"
+}
+
 write_unit_file() {
-    local unit_file rclone_exec config_exec
-    unit_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/rclone@.service"
-    mkdir -p -- "${unit_file%/*}" || return 1
+    local remote=$1 unit=$2 unit_dir unit_file
+    local rclone_exec config_exec remote_exec
+    # An invocation-only XDG_CONFIG_HOME may not be in the running user
+    # manager's search path. This conventional directory is stable.
+    unit_dir="$HOME/.config/systemd/user"
+    unit_file="$unit_dir/$unit"
+    mkdir -p -- "$unit_dir" || return 1
     rclone_exec=$(escape_systemd_exec_value "$RCLONE_BIN") || return 1
     config_exec=$(escape_systemd_exec_value "$CONFIG_PATH") || return 1
+    remote_exec=$(escape_systemd_exec_value "$remote") || return 1
 
     cat > "$unit_file" <<EOF
 [Unit]
-Description=rclone: Remote FUSE filesystem for %I
+Description=Rclone remote mount ${unit%.service}
 Documentation=man:rclone(1)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/bin/mkdir -p "%h/mnt/%i"
+ExecStartPre=/bin/mkdir -p "%h/mnt/${unit%.service}"
 ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --config "$config_exec" \\
         --vfs-cache-mode full \\
         --vfs-cache-max-size 1G \\
         --log-level INFO \\
-        --log-file "/tmp/rclone-%i.log" \\
+        --log-file "/tmp/${unit%.service}.log" \\
         --umask 077 \\
-        "%I:" "%h/mnt/%i"
-ExecStop=/bin/fusermount -u "%h/mnt/%i"
+        -- "$remote_exec:" "%h/mnt/${unit%.service}"
+ExecStop=/bin/fusermount -u "%h/mnt/${unit%.service}"
 Restart=on-failure
 RestartSec=1m
 StandardOutput=journal
@@ -333,16 +352,24 @@ WantedBy=default.target
 EOF
 }
 
+write_selected_units() {
+    local remote unit
+    for remote in "${SELECTED_REMOTES[@]}"; do
+        unit=$(service_unit "$remote") || return 1
+        write_unit_file "$remote" "$unit" || return 1
+    done
+}
+
 enable_selected_remotes() {
-    local remote unit instance failed=0
+    local remote unit failed=0
     systemctl --user daemon-reload || return 1
     for remote in "${SELECTED_REMOTES[@]}"; do
-        unit=$(systemd-escape --template=rclone@.service -- "$remote") || return 1
-        if systemctl --user enable --now "$unit"; then
-            instance=${unit#rclone@}
-            instance=${instance%.service}
+        unit=$(service_unit "$remote") || return 1
+        # restart also starts an inactive unit and guarantees that rerunning
+        # the installer applies the freshly written service definition.
+        if systemctl --user enable "$unit" && systemctl --user restart "$unit"; then
             printf 'Started %s as %s (mountpoint: %s/mnt/%s)\n' \
-                "$remote" "$unit" "$HOME" "$instance"
+                "$remote" "$unit" "$HOME" "${unit%.service}"
         else
             echo "Error: Failed to enable or start $unit" >&2
             failed=1
@@ -363,8 +390,8 @@ main() {
     fi
 
     ensure_rclone || return 1
-    command -v systemd-escape >/dev/null || {
-        echo "Error: systemd-escape is required." >&2
+    command -v sha256sum >/dev/null || {
+        echo "Error: sha256sum is required." >&2
         return 1
     }
     resolve_config_path || return 1
@@ -375,7 +402,7 @@ main() {
         2) return 0 ;;
         *) return 1 ;;
     esac
-    write_unit_file || return 1
+    write_selected_units || return 1
     enable_selected_remotes || return 1
 
     echo $'\e[92mInstallation completed. Selected services are running.\e[0m'

@@ -1,5 +1,6 @@
 """Remote discovery, selection and systemd unit regression tests."""
 
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -94,6 +95,14 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(interactive.returncode, 0, interactive.stderr)
         self.assertEqual(interactive.stdout.splitlines()[-2:], ["<two words>", "<three>"])
 
+        decimal = run_bash(
+            'stdin_is_terminal() { return 0; }; '
+            'AVAILABLE_REMOTES=(one two three four five six seven eight nine ten); '
+            'select_remotes || exit; printf \'<%s>\\n\' "${SELECTED_REMOTES[@]}"',
+            input_text="08 010\n")
+        self.assertEqual(decimal.returncode, 0, decimal.stderr)
+        self.assertEqual(decimal.stdout.splitlines()[-2:], ["<eight>", "<ten>"])
+
     def test_invalid_and_noninteractive_selection_fails(self):
         for args in [("missing",), ("--all", "one"), ("--",), ("--help", "one")]:
             with self.subTest(args=args):
@@ -119,7 +128,7 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), str(link))
 
-    def test_unit_uses_unescaped_remote_and_escaped_instance_mountpoint(self):
+    def test_unit_embeds_remote_and_uses_stable_user_unit_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_home = root / "config home"
@@ -128,29 +137,71 @@ class RemoteTests(unittest.TestCase):
             rclone = root / 'bin $with%quotes"' / "rclone"
             rclone.parent.mkdir()
             rclone.touch()
+            remote = "-Google $Drive%"
             env = {
                 "HOME": str(root / "home"),
                 "XDG_CONFIG_HOME": str(config_home),
             }
             result = run_bash(
-                'RCLONE_BIN="$1"; CONFIG_PATH="$2"; write_unit_file',
-                args=(str(rclone), str(config)), env=env)
+                'RCLONE_BIN="$1"; CONFIG_PATH="$2"; '
+                'unit=$(service_unit "$3") || exit; '
+                'write_unit_file "$3" "$unit" || exit; printf \'%s\\n\' "$unit"',
+                args=(str(rclone), str(config), remote), env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            unit = config_home / "systemd/user/rclone@.service"
+            unit_name = result.stdout.strip()
+            self.assertEqual(len(unit_name), len("rclone-") + 24 + len(".service"))
+            unit = Path(env["HOME"]) / ".config/systemd/user" / unit_name
+            self.assertTrue(unit.is_file())
+            self.assertFalse((config_home / "systemd/user" / unit_name).exists())
             contents = unit.read_text()
-            self.assertIn('Description=rclone: Remote FUSE filesystem for %I', contents)
-            self.assertIn('"%I:" "%h/mnt/%i"', contents)
+            self.assertIn(f'Description=Rclone remote mount {unit_name[:-8]}', contents)
+            self.assertIn('-- "-Google $$Drive%%:"', contents)
             self.assertIn('--config "', contents)
-            self.assertNotIn("Google Drive", contents)
+            self.assertIn(f'"%h/mnt/{unit_name[:-8]}"', contents)
             verify = subprocess.run(
                 ["systemd-analyze", "verify", str(unit)], text=True,
                 capture_output=True, timeout=10)
             self.assertEqual(verify.returncode, 0, verify.stderr)
 
-    def test_enable_uses_systemd_escaped_unit_names(self):
-        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод"]
+    def test_config_and_remote_are_scoped_to_distinct_units(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            home = root / "home"
+            rclone = root / "rclone"
+            rclone.touch()
+            configs = [root / "one.conf", root / "two.conf"]
+            for config in configs:
+                config.touch()
+            result = run_bash(
+                'RCLONE_BIN="$1"; remote=same; '
+                'CONFIG_PATH="$2"; first=$(service_unit "$remote") || exit; '
+                'write_unit_file "$remote" "$first" || exit; '
+                'CONFIG_PATH="$3"; second=$(service_unit "$remote") || exit; '
+                'write_unit_file "$remote" "$second" || exit; '
+                'printf \'%s\\n%s\\n\' "$first" "$second"',
+                args=(str(rclone), *(str(path) for path in configs)),
+                env={"HOME": str(home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            units = result.stdout.splitlines()
+            self.assertEqual(len(set(units)), 2)
+            unit_dir = home / ".config/systemd/user"
+            for unit_name, config in zip(units, configs):
+                self.assertIn(str(config), (unit_dir / unit_name).read_text())
+
+    def test_long_remote_uses_bounded_unit_name(self):
+        long_remote = "remote-" + "ю" * 300
+        result = run_bash(
+            'CONFIG_PATH=/tmp/rclone.conf; service_unit "$1"',
+            args=(long_remote,))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.strip()), len("rclone-") + 24 + len(".service"))
+
+    def test_enable_uses_stable_units_and_restarts_them(self):
+        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод",
+                 "remote-" + "x" * 300]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "rclone.conf"
             calls = root / "systemctl.calls"
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -164,16 +215,17 @@ class RemoteTests(unittest.TestCase):
             }
             array = " ".join(shlex.quote(name) for name in names)
             result = run_bash(
+                f'CONFIG_PATH={shlex.quote(str(config))}; '
                 f"SELECTED_REMOTES=({array}); enable_selected_remotes",
                 env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             actual = calls.read_text().splitlines()
             expected = ["--user daemon-reload"]
             for name in names:
-                escaped = subprocess.run(
-                    ["systemd-escape", "--template=rclone@.service", "--", name],
-                    text=True, capture_output=True, check=True).stdout.strip()
-                expected.append(f"--user enable --now {escaped}")
+                payload = str(config).encode() + b"\0" + name.encode() + b"\0"
+                unit = f"rclone-{hashlib.sha256(payload).hexdigest()[:24]}.service"
+                expected.append(f"--user enable {unit}")
+                expected.append(f"--user restart {unit}")
             self.assertEqual(actual, expected)
 
 

@@ -73,16 +73,24 @@ written into the unit as `--config`, so a non-default configuration continues to
 work after the invoking shell exits.
 
 The script never edits or renames entries in `rclone.conf`. Remote names are
-encoded reversibly with `systemd-escape` for the unit instance. The unit receives
-the original name through `%I`, while the mount directory uses the escaped `%i`
-value to remain safe and collision-free. Ordinary names therefore mount at the
-familiar path, for example `GoogleDrive` at `~/mnt/GoogleDrive`; special names
-may produce paths such as `~/mnt/Google\x20Drive`.
+stored directly in a dedicated service definition. Each pair of absolute config
+path and remote name gets a stable, bounded identifier derived from SHA-256, for
+example `rclone-0123456789abcdef01234567.service`. This keeps configurations
+isolated, avoids systemd's unit-name length limit, and makes spaces, Unicode,
+slashes and leading dashes safe. Generated units are placed in the conventional
+`~/.config/systemd/user` directory so a temporary `XDG_CONFIG_HOME` used for
+Rclone discovery cannot hide them from the running user manager.
+
+The corresponding mount directory uses the same identifier, for example
+`~/mnt/rclone-0123456789abcdef01234567`. The script prints the exact service and
+mountpoint for every selected remote. Rerunning it rewrites and restarts the
+selected services so executable, configuration and option changes take effect
+immediately; services created for other configuration files remain unchanged.
 
 Each selected remote is enabled and started as a user service. For example:
 
 ```sh
-systemctl --user status 'rclone@GoogleDrive.service'
+systemctl --user status 'rclone-0123456789abcdef01234567.service'
 ```
 
 ## Tests
@@ -98,5 +106,6 @@ The tests mock downloads, privilege escalation, package managers and systemctl.
 They do not install packages, contact the network or start user services. They
 cover package and architecture selection, script fallback, cancellation,
 download/installation failures, temporary-file cleanup, executable validation,
-remote discovery and selection, special remote names, systemd escaping and unit
-syntax validation.
+remote discovery and selection, special remote names, systemd value escaping,
+unit syntax validation, config isolation, bounded service names and restart
+behavior.
