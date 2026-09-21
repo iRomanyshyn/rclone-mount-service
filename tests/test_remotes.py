@@ -24,7 +24,7 @@ def run_bash(code, *, args=(), env=None, input_text=None, cwd=None):
 
 class RemoteTests(unittest.TestCase):
     def test_load_remotes_uses_rclone_and_does_not_modify_config(self):
-        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод"]
+        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "ÑÐ½ÑÐºÐ¾Ð´"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config with spaces.conf"
@@ -36,7 +36,7 @@ class RemoteTests(unittest.TestCase):
                 "#!/bin/bash\n"
                 'printf \'%s\\n\' "$*" >> "$CALLS"\n'
                 "printf '%s\\n' 'Google Drive:' 'foo.bar:' 'foo/bar:' "
-                "'foo-bar:' 'юнікод:'\n"
+                "'foo-bar:' 'ÑÐ½ÑÐºÐ¾Ð´:'\n"
             )
             rclone.chmod(0o755)
             result = run_bash(
@@ -171,7 +171,7 @@ class RemoteTests(unittest.TestCase):
             self.assertNotIn('--log-file', contents)
             self.assertNotIn('ExecStop=', contents)
             verify = subprocess.run(
-                ["systemd-analyze", "verify", str(unit)], text=True,
+                ["systemd-analyze", "verify", "--man=no", str(unit)], text=True,
                 capture_output=True, timeout=10)
             self.assertEqual(verify.returncode, 0, verify.stderr)
 
@@ -201,7 +201,7 @@ class RemoteTests(unittest.TestCase):
                 self.assertIn(str(config), (unit_dir / unit_name).read_text())
 
     def test_long_remote_uses_bounded_unit_name(self):
-        long_remote = "remote-" + "ю" * 300
+        long_remote = "remote-" + "Ñ" * 300
         result = run_bash(
             'CONFIG_PATH=/tmp/rclone.conf; service_unit "$1"',
             args=(long_remote,))
@@ -287,7 +287,7 @@ class RemoteTests(unittest.TestCase):
             )
 
     def test_enable_uses_stable_units_and_restarts_them(self):
-        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод",
+        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "ÑÐ½ÑÐºÐ¾Ð´",
                  "remote-" + "x" * 300]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
