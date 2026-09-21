@@ -863,10 +863,13 @@ list_mounts() {
 }
 
 unit_is_expected() {
-    local unit=$1 remote expected
+    local unit=$1 remote expected legacy
     for remote in "${AVAILABLE_REMOTES[@]}"; do
         expected=$(service_unit "$remote") || return 2
-        [ "$expected" = "$unit" ] && return 0
+        legacy=$(legacy_service_unit "$remote") || return 2
+        if [ "$expected" = "$unit" ] || [ "$legacy" = "$unit" ]; then
+            return 0
+        fi
     done
     return 1
 }
