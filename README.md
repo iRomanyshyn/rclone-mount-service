@@ -45,6 +45,54 @@ Installing an official package from a
 URL does not add an upstream APT/RPM repository or automatically configure
 future upstream updates. FUSE is still required for mounting.
 
+## Selecting and mounting remotes
+
+Run the script without arguments to select one or more configured remotes from
+an interactive numbered list:
+
+```sh
+./rclone-mount-service.sh
+```
+
+For unattended use, pass exact remote names or explicitly request every remote:
+
+```sh
+./rclone-mount-service.sh "Google Drive" Encrypted:
+./rclone-mount-service.sh --all
+```
+
+Names may be written with or without their trailing colon. Use `--` before a
+remote whose name begins with a dash. With redirected input, a selection is
+required; the script will not silently mount every configured remote.
+
+Remotes are discovered with `rclone listremotes --source file`, using the exact
+configuration selected by `RCLONE_CONFIG` or the default XDG configuration
+path. Environment-only remotes are excluded because their environment would not
+automatically exist in the user service. The absolute configuration path is
+written into the unit as `--config`, so a non-default configuration continues to
+work after the invoking shell exits.
+
+The script never edits or renames entries in `rclone.conf`. Remote names are
+stored directly in a dedicated service definition. Each pair of absolute config
+path and remote name gets a stable, bounded identifier derived from SHA-256, for
+example `rclone-0123456789abcdef01234567.service`. This keeps configurations
+isolated, avoids systemd's unit-name length limit, and makes spaces, Unicode,
+slashes and leading dashes safe. Generated units are placed in the conventional
+`~/.config/systemd/user` directory so a temporary `XDG_CONFIG_HOME` used for
+Rclone discovery cannot hide them from the running user manager.
+
+The corresponding mount directory uses the same identifier, for example
+`~/mnt/rclone-0123456789abcdef01234567`. The script prints the exact service and
+mountpoint for every selected remote. Rerunning it rewrites and restarts the
+selected services so executable, configuration and option changes take effect
+immediately; services created for other configuration files remain unchanged.
+
+Each selected remote is enabled and started as a user service. For example:
+
+```sh
+systemctl --user status 'rclone-0123456789abcdef01234567.service'
+```
+
 ## Tests
 
 Run the installer regression tests with Python 3 and Bash:
@@ -54,7 +102,10 @@ bash -n rclone-mount-service.sh
 python3 -m unittest discover -s tests -v
 ```
 
-The tests mock downloads, privilege escalation and package managers. They do not
-install packages, contact the network or start user services. They cover package
-and architecture selection, script fallback, cancellation, download/installation
-failures, temporary-file cleanup and reuse/validation of an existing executable.
+The tests mock downloads, privilege escalation, package managers and systemctl.
+They do not install packages, contact the network or start user services. They
+cover package and architecture selection, script fallback, cancellation,
+download/installation failures, temporary-file cleanup, executable validation,
+remote discovery and selection, special remote names, systemd value escaping,
+unit syntax validation, config isolation, bounded service names and restart
+behavior.

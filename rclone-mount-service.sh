@@ -149,73 +149,199 @@ ensure_rclone() {
     fi
 }
 
-main() {
-    # Check if the script is run as root
-    if [ "$EUID" -eq 0 ]; then
-        echo "Error: This script should not be run as root. Please run it as a regular user. This script is designed to configure the mounting of remote resources in the user profile, ensuring that only the current user has access to their own files." >&2
+usage() {
+    cat <<'EOF'
+Usage:
+  rclone-mount-service.sh                  Select remotes interactively
+  rclone-mount-service.sh --all            Mount all file-defined remotes
+  rclone-mount-service.sh REMOTE [...]     Mount the named remotes
+
+REMOTE may be written with or without the trailing colon shown by
+`rclone listremotes`. Quote names containing spaces.
+EOF
+}
+
+resolve_config_path() {
+    local config_dir
+    CONFIG_PATH=${RCLONE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/rclone/rclone.conf}
+    case "$CONFIG_PATH" in
+        /*) ;;
+        *) CONFIG_PATH="$PWD/$CONFIG_PATH" ;;
+    esac
+    if [ ! -f "$CONFIG_PATH" ]; then
+        echo "Error: Rclone configuration file not found: $CONFIG_PATH" >&2
+        echo "Run 'rclone config' to create it or set RCLONE_CONFIG." >&2
         return 1
     fi
 
-    ensure_rclone || return 1
+    # Normalize the parent path while preserving a configuration-file symlink.
+    config_dir=$(dirname -- "$CONFIG_PATH") || return 1
+    config_dir=$(cd -- "$config_dir" && pwd -P) || return 1
+    CONFIG_PATH="$config_dir/${CONFIG_PATH##*/}"
+}
 
-    # Get remote names from rclone config file
-    config_path="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+load_remotes() {
+    local output remote
+    AVAILABLE_REMOTES=()
+    if ! output=$("$RCLONE_BIN" listremotes --config "$CONFIG_PATH" --source file); then
+        echo "Error: Failed to list file-defined Rclone remotes." >&2
+        echo "This script requires an Rclone version supporting 'listremotes --source file'." >&2
+        return 1
+    fi
+    while IFS= read -r remote; do
+        [ -n "$remote" ] || continue
+        AVAILABLE_REMOTES+=("${remote%:}")
+    done <<< "$output"
+    if [ "${#AVAILABLE_REMOTES[@]}" -eq 0 ]; then
+        echo "Error: No file-defined remotes found in $CONFIG_PATH" >&2
+        return 1
+    fi
+}
 
-    if [ -f "$config_path" ]; then
+remote_exists() {
+    local candidate
+    for candidate in "${AVAILABLE_REMOTES[@]}"; do
+        [ "$candidate" = "$1" ] && return 0
+    done
+    return 1
+}
 
-      remotes=$(grep '\[.*\]' "$config_path" | tr -d '[]')
+add_selected_remote() {
+    local selected
+    remote_exists "$1" || {
+        echo "Error: Unknown remote: $1" >&2
+        return 1
+    }
+    for selected in "${SELECTED_REMOTES[@]}"; do
+        [ "$selected" = "$1" ] && return 0
+    done
+    SELECTED_REMOTES+=("$1")
+}
 
-    else
-        echo "Error: Rclone configuration file not found. Run 'rclone config' to create a configuration file."
-        exit 1
+stdin_is_terminal() {
+    [ -t 0 ]
+}
+
+select_remotes() {
+    local argument answer item index
+    local -a choices
+    SELECTED_REMOTES=()
+
+    if [ "$#" -gt 0 ]; then
+        case "$1" in
+            -h|--help)
+                usage
+                [ "$#" -eq 1 ] && return 2
+                echo "Error: Help cannot be combined with remote names." >&2
+                return 1
+                ;;
+            --all)
+                [ "$#" -eq 1 ] || {
+                    echo "Error: --all cannot be combined with remote names." >&2
+                    return 1
+                }
+                SELECTED_REMOTES=("${AVAILABLE_REMOTES[@]}")
+                return 0
+                ;;
+            --) shift ;;
+        esac
+        [ "$#" -gt 0 ] || {
+            echo "Error: No remotes specified after --." >&2
+            return 1
+        }
+        for argument in "$@"; do
+            add_selected_remote "${argument%:}" || return 1
+        done
+        return 0
     fi
 
-    # Validate and rename remotes
-    for remote in $remotes; do
-
-      new_remote="${remote//[^A-Za-z0-9_-]/_}"
-
-      if [ "$remote" != "$new_remote" ]; then
-
-        echo "Renaming remote $remote to $new_remote"
-
-        sed -i "s/$remote/$new_remote/" "$config_path"
-    
-        remotes=$(grep '\[\w*\]' "$config_path" | tr -d '[]')
-
-      fi
-
+    if ! stdin_is_terminal; then
+        echo "Error: No remotes specified in non-interactive mode. Use --all or pass remote names." >&2
+        return 1
+    fi
+    echo "Available file-defined remotes:"
+    for index in "${!AVAILABLE_REMOTES[@]}"; do
+        printf '  %d) %s\n' "$((index + 1))" "${AVAILABLE_REMOTES[index]}"
     done
+    read -r -p "Select remotes by number (space-separated), or type 'all': " answer || return 1
+    if [ "$answer" = all ]; then
+        SELECTED_REMOTES=("${AVAILABLE_REMOTES[@]}")
+        return 0
+    fi
+    read -r -a choices <<< "$answer"
+    for item in "${choices[@]}"; do
+        case "$item" in
+            ''|*[!0-9]*)
+                echo "Error: Invalid selection: $item" >&2
+                return 1
+                ;;
+        esac
+        index=$((10#$item))
+        if [ "$index" -lt 1 ] || [ "$index" -gt "${#AVAILABLE_REMOTES[@]}" ]; then
+            echo "Error: Selection out of range: $item" >&2
+            return 1
+        fi
+        add_selected_remote "${AVAILABLE_REMOTES[index - 1]}" || return 1
+    done
+    [ "${#SELECTED_REMOTES[@]}" -gt 0 ] || {
+        echo "Error: No remotes selected." >&2
+        return 1
+    }
+}
 
-    # Create systemd unit file
-    unit_file="${HOME}/.config/systemd/user/rclone@.service"
-    mkdir -p -- "${unit_file%/*}" || return 1
+escape_systemd_exec_value() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//%/%%}
+    value=${value//\$/\$\$}
+    printf '%s' "$value"
+}
 
-    # Escape the executable path for systemd's quoted ExecStart syntax.
-    rclone_exec=${RCLONE_BIN//\\/\\\\}
-    rclone_exec=${rclone_exec//\"/\\\"}
-    rclone_exec=${rclone_exec//%/%%}
-    rclone_exec=${rclone_exec//\$/\$\$}
+service_unit() {
+    local digest
+    digest=$(printf '%s\0%s\0' "$CONFIG_PATH" "$1" | sha256sum) || return 1
+    digest=${digest%% *}
+    case "$digest" in
+        *[!0-9a-f]*|'')
+            echo "Error: sha256sum returned an invalid digest." >&2
+            return 1
+            ;;
+    esac
+    printf 'rclone-%s.service\n' "${digest:0:24}"
+}
 
-    # Write the systemd unit file
+write_unit_file() {
+    local remote=$1 unit=$2 unit_dir unit_file
+    local rclone_exec config_exec remote_exec
+    # An invocation-only XDG_CONFIG_HOME may not be in the running user
+    # manager's search path. This conventional directory is stable.
+    unit_dir="$HOME/.config/systemd/user"
+    unit_file="$unit_dir/$unit"
+    mkdir -p -- "$unit_dir" || return 1
+    rclone_exec=$(escape_systemd_exec_value "$RCLONE_BIN") || return 1
+    config_exec=$(escape_systemd_exec_value "$CONFIG_PATH") || return 1
+    remote_exec=$(escape_systemd_exec_value "$remote") || return 1
+
     cat > "$unit_file" <<EOF
 [Unit]
-Description=rclone: Remote FUSE filesystem for cloud storage config %i
+Description=Rclone remote mount ${unit%.service}
 Documentation=man:rclone(1)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/bin/mkdir -p %h/mnt/%i
-ExecStart="$rclone_exec" mount \\
+ExecStartPre=/bin/mkdir -p "%h/mnt/${unit%.service}"
+ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
+        --config "$config_exec" \\
         --vfs-cache-mode full \\
         --vfs-cache-max-size 1G \\
         --log-level INFO \\
-        --log-file /tmp/rclone-%i.log \\
+        --log-file "/tmp/${unit%.service}.log" \\
         --umask 077 \\
-        %i: %h/mnt/%i
-ExecStop=/bin/fusermount -u %h/mnt/%i
+        -- "$remote_exec:" "%h/mnt/${unit%.service}"
+ExecStop=/bin/fusermount -u "%h/mnt/${unit%.service}"
 Restart=on-failure
 RestartSec=1m
 StandardOutput=journal
@@ -224,16 +350,62 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 EOF
+}
 
-    # Reload systemd and enable services
-    systemctl --user daemon-reload
-
-    for remote in $remotes; do
-      systemctl --user enable --now "rclone@${remote}"
+write_selected_units() {
+    local remote unit
+    for remote in "${SELECTED_REMOTES[@]}"; do
+        unit=$(service_unit "$remote") || return 1
+        write_unit_file "$remote" "$unit" || return 1
     done
+}
 
-    # Display completion message and usage instructions
-    echo $'\e[92mInstallation completed. Services started for all remotes.\e[0m'
+enable_selected_remotes() {
+    local remote unit failed=0
+    systemctl --user daemon-reload || return 1
+    for remote in "${SELECTED_REMOTES[@]}"; do
+        unit=$(service_unit "$remote") || return 1
+        # restart also starts an inactive unit and guarantees that rerunning
+        # the installer applies the freshly written service definition.
+        if systemctl --user enable "$unit" && systemctl --user restart "$unit"; then
+            printf 'Started %s as %s (mountpoint: %s/mnt/%s)\n' \
+                "$remote" "$unit" "$HOME" "${unit%.service}"
+        else
+            echo "Error: Failed to enable or start $unit" >&2
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+main() {
+    if [ "$#" -eq 1 ] && { [ "$1" = -h ] || [ "$1" = --help ]; }; then
+        usage
+        return 0
+    fi
+    # Check if the script is run as root
+    if [ "$EUID" -eq 0 ]; then
+        echo "Error: This script should not be run as root. Please run it as a regular user. This script is designed to configure the mounting of remote resources in the user profile, ensuring that only the current user has access to their own files." >&2
+        return 1
+    fi
+
+    ensure_rclone || return 1
+    command -v sha256sum >/dev/null || {
+        echo "Error: sha256sum is required." >&2
+        return 1
+    }
+    resolve_config_path || return 1
+    load_remotes || return 1
+    select_remotes "$@"
+    case $? in
+        0) ;;
+        2) return 0 ;;
+        *) return 1 ;;
+    esac
+    write_selected_units || return 1
+    enable_selected_remotes || return 1
+
+    echo $'\e[92mInstallation completed. Selected services are running.\e[0m'
     echo "To add additional remotes, run the following command:"
     echo -e $'\e[96mrclone config\e[0m'
     echo "Follow the prompts to add a new remote. After adding, run the script again to start the service for the new remote."
