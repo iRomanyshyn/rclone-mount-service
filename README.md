@@ -115,11 +115,6 @@ fallback. Consequently:
 - changing options for a remote updates the same predictable unit;
 - each service receives an explicit absolute `--config` path.
 
-Upgrading from the opaque `rclone-<24-hex-id>.service` naming automatically
-stops and removes that managed legacy unit when the corresponding remote is
-configured again. Its mountpoint and cache identifier stay unchanged so queued
-VFS writes are not abandoned during the rename.
-
 Each unit also receives an explicit isolated cache directory under
 `$XDG_CACHE_HOME/rclone-mount-service/`, or `~/.cache/rclone-mount-service/`
 when that variable is unset. Separate caches matter
