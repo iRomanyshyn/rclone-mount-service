@@ -595,6 +595,8 @@ write_unit_file() {
     runtime_exec=$(escape_systemd_exec_value "$runtime_dir") || return 1
     socket_exec=$(escape_systemd_exec_value "$rc_socket") || return 1
     timeout_exec=$(escape_systemd_exec_value "${SHUTDOWN_TIMEOUT:-30m}") || return 1
+    # Expanded later by the bash process started from the generated unit.
+    # shellcheck disable=SC2016
     stop_script='empty=0; while queue=$("$1" rc --unix-socket "$2" vfs/queue 2>/dev/null); do if [[ $queue == *'"'"'"name"'"'"'* ]]; then empty=0; else ((empty += 1)); ((empty >= 2)) && exit 0; fi; sleep 1; done; echo "Warning: unable to inspect the Rclone VFS upload queue; cached writes will resume on the next start." >&2; exit 0'
     stop_exec=$(escape_systemd_exec_value "$stop_script") || return 1
     temporary_unit=$(mktemp "$unit_dir/.${unit}.XXXXXX") || return 1
