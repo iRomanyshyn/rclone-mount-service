@@ -45,6 +45,46 @@ Installing an official package from a
 URL does not add an upstream APT/RPM repository or automatically configure
 future upstream updates. FUSE is still required for mounting.
 
+## Selecting and mounting remotes
+
+Run the script without arguments to select one or more configured remotes from
+an interactive numbered list:
+
+```sh
+./rclone-mount-service.sh
+```
+
+For unattended use, pass exact remote names or explicitly request every remote:
+
+```sh
+./rclone-mount-service.sh "Google Drive" Encrypted:
+./rclone-mount-service.sh --all
+```
+
+Names may be written with or without their trailing colon. Use `--` before a
+remote whose name begins with a dash. With redirected input, a selection is
+required; the script will not silently mount every configured remote.
+
+Remotes are discovered with `rclone listremotes --source file`, using the exact
+configuration selected by `RCLONE_CONFIG` or the default XDG configuration
+path. Environment-only remotes are excluded because their environment would not
+automatically exist in the user service. The absolute configuration path is
+written into the unit as `--config`, so a non-default configuration continues to
+work after the invoking shell exits.
+
+The script never edits or renames entries in `rclone.conf`. Remote names are
+encoded reversibly with `systemd-escape` for the unit instance. The unit receives
+the original name through `%I`, while the mount directory uses the escaped `%i`
+value to remain safe and collision-free. Ordinary names therefore mount at the
+familiar path, for example `GoogleDrive` at `~/mnt/GoogleDrive`; special names
+may produce paths such as `~/mnt/Google\x20Drive`.
+
+Each selected remote is enabled and started as a user service. For example:
+
+```sh
+systemctl --user status 'rclone@GoogleDrive.service'
+```
+
 ## Tests
 
 Run the installer regression tests with Python 3 and Bash:
@@ -54,7 +94,9 @@ bash -n rclone-mount-service.sh
 python3 -m unittest discover -s tests -v
 ```
 
-The tests mock downloads, privilege escalation and package managers. They do not
-install packages, contact the network or start user services. They cover package
-and architecture selection, script fallback, cancellation, download/installation
-failures, temporary-file cleanup and reuse/validation of an existing executable.
+The tests mock downloads, privilege escalation, package managers and systemctl.
+They do not install packages, contact the network or start user services. They
+cover package and architecture selection, script fallback, cancellation,
+download/installation failures, temporary-file cleanup, executable validation,
+remote discovery and selection, special remote names, systemd escaping and unit
+syntax validation.
