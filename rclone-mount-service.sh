@@ -548,19 +548,10 @@ mount_digest() {
     printf '%s\n' "$digest"
 }
 
-# PR #4 used this opaque name. It remains the stable storage identifier so an
-# upgrade keeps the existing mountpoint and, crucially, the VFS cache that may
-# contain writes awaiting upload.
-legacy_service_unit() {
+mount_storage_id() {
     local digest
     digest=$(mount_digest "$1") || return 1
-    printf 'rclone-%s.service\n' "${digest:0:24}"
-}
-
-mount_storage_id() {
-    local legacy
-    legacy=$(legacy_service_unit "$1") || return 1
-    printf '%s\n' "${legacy%.service}"
+    printf 'rclone-%s\n' "${digest:0:24}"
 }
 
 service_unit() {
@@ -758,7 +749,6 @@ write_selected_units() {
 
 enable_selected_remotes() {
     local remote unit mountpoint failed=0
-    migrate_legacy_units || return 1
     systemctl --user daemon-reload || return 1
     for remote in "${SELECTED_REMOTES[@]}"; do
         unit=$(service_unit "$remote") || {
@@ -785,49 +775,6 @@ enable_selected_remotes() {
     return "$failed"
 }
 
-managed_unit_file() {
-    local unit=$1 unit_file marker config_line current_config
-    unit_file="$(unit_directory)/$unit"
-    [ -f "$unit_file" ] || return 1
-    {
-        IFS= read -r marker
-        IFS= read -r config_line
-    } < "$unit_file"
-    current_config=$(config_digest) || return 1
-    [ "$marker" = '# Managed by rclone-mount-service' ] &&
-        [ "$config_line" = "# Config-SHA256=$current_config" ]
-}
-
-force_unmount() {
-    local path=$1
-    "$MOUNTPOINT_BIN" -q -- "$path" || return 0
-    "$FUSERMOUNT_BIN" -u "$path" || "$FUSERMOUNT_BIN" -uz "$path"
-}
-
-migrate_legacy_units() {
-    local remote unit legacy unit_file mountpoint failed=0 removed=0
-    for remote in "${SELECTED_REMOTES[@]}"; do
-        unit=$(service_unit "$remote") || return 1
-        legacy=$(legacy_service_unit "$remote") || return 1
-        [ "$unit" != "$legacy" ] || continue
-        managed_unit_file "$legacy" || continue
-        unit_file="$(unit_directory)/$legacy"
-        mountpoint=$(mountpoint_for "$remote") || return 1
-        if systemctl --user disable --now "$legacy" &&
-           force_unmount "$mountpoint" && rm -- "$unit_file"; then
-            printf 'Migrated %s from %s to %s\n' "$remote" "$legacy" "$unit"
-            removed=1
-        else
-            echo "Error: Failed to stop and migrate legacy unit $legacy" >&2
-            failed=1
-        fi
-    done
-    if [ "$removed" -eq 1 ]; then
-        systemctl --user daemon-reload || failed=1
-    fi
-    return "$failed"
-}
-
 unit_mountpoint() {
     local unit=$1 remote=$2 unit_file value
     unit_file="$(unit_directory)/$unit"
@@ -842,15 +789,11 @@ unit_mountpoint() {
 }
 
 list_mounts() {
-    local remote unit legacy unit_file state mountpoint
+    local remote unit unit_file state mountpoint
     printf 'REMOTE\tUNIT\tSTATE\tMOUNTPOINT\n'
     for remote in "${AVAILABLE_REMOTES[@]}"; do
         unit=$(service_unit "$remote") || return 1
-        legacy=$(legacy_service_unit "$remote") || return 1
         unit_file="$(unit_directory)/$unit"
-        if [ ! -f "$unit_file" ] && [ -f "$(unit_directory)/$legacy" ]; then
-            unit=$legacy
-        fi
         if [ -f "$(unit_directory)/$unit" ]; then
             state=$(systemctl --user is-active "$unit" 2>/dev/null || true)
             [ -n "$state" ] || state=unknown
@@ -863,13 +806,10 @@ list_mounts() {
 }
 
 unit_is_expected() {
-    local unit=$1 remote expected legacy
+    local unit=$1 remote expected
     for remote in "${AVAILABLE_REMOTES[@]}"; do
         expected=$(service_unit "$remote") || return 2
-        legacy=$(legacy_service_unit "$remote") || return 2
-        if [ "$expected" = "$unit" ] || [ "$legacy" = "$unit" ]; then
-            return 0
-        fi
+        [ "$expected" = "$unit" ] && return 0
     done
     return 1
 }
