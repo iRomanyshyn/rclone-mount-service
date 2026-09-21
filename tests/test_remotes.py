@@ -12,6 +12,27 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / "rclone-mount-service.sh"
 
 
+def mount_digest(config, remote):
+    payload = str(config).encode() + b"\0" + remote.encode() + b"\0"
+    return hashlib.sha256(payload).hexdigest()
+
+
+def storage_id(config, remote):
+    return f"rclone-{mount_digest(config, remote)[:24]}"
+
+
+def service_unit(config, remote):
+    escaped = subprocess.run(
+        ["systemd-escape", "--", remote], check=True, text=True,
+        capture_output=True,
+    ).stdout.strip()
+    digest = mount_digest(config, remote)
+    candidate = f"rclone@{escaped}-{digest[:12]}.service"
+    if len(candidate.encode()) <= 255:
+        return candidate
+    return f"rclone@remote-{digest[:24]}.service"
+
+
 def run_bash(code, *, args=(), env=None, input_text=None, cwd=None):
     command = ["bash", "-c", 'source "$SCRIPT"\n' + code, "test"]
     command.extend(args)
@@ -24,7 +45,7 @@ def run_bash(code, *, args=(), env=None, input_text=None, cwd=None):
 
 class RemoteTests(unittest.TestCase):
     def test_load_remotes_uses_rclone_and_does_not_modify_config(self):
-        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "ÑÐ½ÑÐºÐ¾Ð´"]
+        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config with spaces.conf"
@@ -36,7 +57,7 @@ class RemoteTests(unittest.TestCase):
                 "#!/bin/bash\n"
                 'printf \'%s\\n\' "$*" >> "$CALLS"\n'
                 "printf '%s\\n' 'Google Drive:' 'foo.bar:' 'foo/bar:' "
-                "'foo-bar:' 'ÑÐ½ÑÐºÐ¾Ð´:'\n"
+                "'foo-bar:' 'юнікод:'\n"
             )
             rclone.chmod(0o755)
             result = run_bash(
@@ -158,20 +179,30 @@ class RemoteTests(unittest.TestCase):
                 args=(str(rclone), str(config), remote), env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             unit_name = result.stdout.strip()
-            self.assertEqual(len(unit_name), len("rclone-") + 24 + len(".service"))
+            self.assertEqual(unit_name, service_unit(config, remote))
+            self.assertTrue(unit_name.startswith("rclone@"))
+            self.assertIn("Google", unit_name)
             unit = Path(env["HOME"]) / ".config/systemd/user" / unit_name
             self.assertTrue(unit.is_file())
             self.assertFalse((config_home / "systemd/user" / unit_name).exists())
             contents = unit.read_text()
-            self.assertIn(f'Description=Rclone remote mount {unit_name[:-8]}', contents)
+            self.assertIn('Description="Rclone mount -Google $Drive%%:"', contents)
             self.assertIn('-- "-Google $$Drive%%:"', contents)
             self.assertIn('--config "', contents)
-            self.assertIn(f'"{env["HOME"]}/mnt/{unit_name[:-8]}"', contents)
+            identifier = storage_id(config, remote)
+            self.assertIn(f'"{env["HOME"]}/mnt/{identifier}"', contents)
             self.assertIn('--cache-dir "', contents)
+            self.assertIn(
+                f'--devname "rclone-mount-service:{identifier}"', contents)
             self.assertIn('--read-only=false', contents)
             self.assertIn('--rc-addr "unix://', contents)
             self.assertNotIn('--log-file', contents)
             self.assertIn('ExecStop=/bin/bash -c ', contents)
+            self.assertIn('kill -TERM', contents)
+            self.assertIn('ExecStopPost=/bin/bash -c ', contents)
+            self.assertIn('--output SOURCE --mountpoint', contents)
+            self.assertIn('refusing to unmount', contents)
+            self.assertIn(' -uz ', contents)
             self.assertIn('TimeoutStopSec=30m', contents)
             verify = subprocess.run(
                 ["systemd-analyze", "verify", "--man=no", str(unit)], text=True,
@@ -204,12 +235,35 @@ class RemoteTests(unittest.TestCase):
                 self.assertIn(str(config), (unit_dir / unit_name).read_text())
 
     def test_long_remote_uses_bounded_unit_name(self):
-        long_remote = "remote-" + "Ñ" * 300
+        long_remote = "remote-" + "ю" * 300
         result = run_bash(
             'CONFIG_PATH=/tmp/rclone.conf; service_unit "$1"',
             args=(long_remote,))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stdout.strip()), len("rclone-") + 24 + len(".service"))
+        self.assertEqual(
+            result.stdout.strip(), service_unit("/tmp/rclone.conf", long_remote))
+        self.assertLessEqual(len(result.stdout.strip().encode()), 255)
+        self.assertTrue(result.stdout.strip().startswith("rclone@remote-"))
+
+    def test_near_name_max_unit_uses_short_temporary_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            config = root / "rclone.conf"
+            rclone = root / "rclone"
+            config.touch()
+            rclone.touch()
+            remote = "x" * 222
+            unit_name = service_unit(config, remote)
+            self.assertGreaterEqual(len(unit_name.encode()), 248)
+            result = run_bash(
+                'RCLONE_BIN="$1"; CONFIG_PATH="$2"; '
+                'unit=$(service_unit "$3") || exit; '
+                'write_unit_file "$3" "$unit" || exit; printf "%s\n" "$unit"',
+                args=(str(rclone), str(config), remote), env={"HOME": str(home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), unit_name)
+            self.assertTrue((home / ".config/systemd/user" / unit_name).is_file())
 
     def test_per_mount_options_and_isolated_cache_are_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -239,8 +293,9 @@ class RemoteTests(unittest.TestCase):
             self.assertIn('--vfs-cache-max-size "2G"', contents)
             self.assertIn('--read-only=true', contents)
             self.assertIn('TimeoutStopSec=2h', contents)
+            identifier = storage_id(config, "one")
             self.assertIn(
-                f'--cache-dir "{root}/cache/rclone-mount-service/{unit_name[:-8]}"',
+                f'--cache-dir "{root}/cache/rclone-mount-service/{identifier}"',
                 contents,
             )
 
@@ -292,7 +347,7 @@ class RemoteTests(unittest.TestCase):
             )
 
     def test_enable_uses_stable_units_and_restarts_them(self):
-        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "ÑÐ½ÑÐºÐ¾Ð´",
+        names = ["Google Drive", "foo.bar", "foo/bar", "foo-bar", "юнікод",
                  "remote-" + "x" * 300]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -317,8 +372,7 @@ class RemoteTests(unittest.TestCase):
             actual = calls.read_text().splitlines()
             expected = ["--user daemon-reload"]
             for name in names:
-                payload = str(config).encode() + b"\0" + name.encode() + b"\0"
-                unit = f"rclone-{hashlib.sha256(payload).hexdigest()[:24]}.service"
+                unit = service_unit(config, name)
                 expected.append(f"--user enable {unit}")
                 expected.append(f"--user restart {unit}")
                 expected.append(f"--user is-active --quiet {unit}")
@@ -334,8 +388,7 @@ class RemoteTests(unittest.TestCase):
             fake_bin.mkdir()
             units = []
             for name in names:
-                payload = str(config).encode() + b"\0" + name.encode() + b"\0"
-                units.append(f"rclone-{hashlib.sha256(payload).hexdigest()[:24]}.service")
+                units.append(service_unit(config, name))
             systemctl = fake_bin / "systemctl"
             systemctl.write_text(
                 '#!/bin/bash\n'
@@ -358,6 +411,51 @@ class RemoteTests(unittest.TestCase):
             self.assertIn(units[0], result.stderr)
             self.assertIn(f"--user restart {units[1]}", calls.read_text())
             self.assertIn(f"--user is-active --quiet {units[1]}", calls.read_text())
+
+    def test_configure_is_explicitly_single_remote(self):
+        result = run_bash(
+            'parse_options configure --read-only one || exit; '
+            'AVAILABLE_REMOTES=(one two); '
+            'select_remotes "${REMOTE_ARGS[@]}" || exit; '
+            'validate_selection_options || exit; '
+            'printf "%s %s %s\n" "$ACTION" "$READ_ONLY" "${SELECTED_REMOTES[0]}"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "configure 1 one")
+
+        multiple = run_bash(
+            'parse_options configure --all || exit; AVAILABLE_REMOTES=(one two); '
+            'select_remotes "${REMOTE_ARGS[@]}" || exit; validate_selection_options')
+        self.assertNotEqual(multiple.returncode, 0)
+
+    def test_list_maps_remote_to_readable_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            config = root / "rclone.conf"
+            config.touch()
+            remote = "Google Drive"
+            unit = service_unit(config, remote)
+            unit_dir = home / ".config/systemd/user"
+            unit_dir.mkdir(parents=True)
+            (unit_dir / unit).write_text(
+                "# Managed by rclone-mount-service\n"
+                "# Config-SHA256=test\n"
+                "# Mountpoint=/srv/cloud files\n"
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            systemctl = fake_bin / "systemctl"
+            systemctl.write_text("#!/bin/bash\necho active\n")
+            systemctl.chmod(0o755)
+            result = run_bash(
+                'CONFIG_PATH="$1"; AVAILABLE_REMOTES=("Google Drive"); list_mounts',
+                args=(str(config),),
+                env={
+                    "HOME": str(home),
+                    "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"Google Drive:\t{unit}\tactive\t/srv/cloud files", result.stdout)
 
 
 if __name__ == "__main__":

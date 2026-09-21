@@ -200,7 +200,8 @@ ensure_rclone() {
         /*) ;;
         *) RCLONE_BIN="$PWD/$RCLONE_BIN" ;;
     esac
-    if ! "$RCLONE_BIN" version || ! "$RCLONE_BIN" mount --help >/dev/null; then
+    if ! "$RCLONE_BIN" version >/dev/null ||
+       ! "$RCLONE_BIN" mount --help >/dev/null; then
         echo "Error: Rclone is not working or does not support mount." >&2
         return 1
     fi
@@ -214,7 +215,9 @@ ensure_rclone() {
 usage() {
     cat <<'EOF'
 Usage:
-  rclone-mount-service.sh [OPTIONS] [REMOTE ...]
+  rclone-mount-service.sh [install] [OPTIONS] [REMOTE ...]
+  rclone-mount-service.sh configure [OPTIONS] REMOTE
+  rclone-mount-service.sh list
   rclone-mount-service.sh --prune
 
 REMOTE may be written with or without the trailing colon shown by
@@ -233,11 +236,14 @@ Options:
 
 Without REMOTE or --all, an interactive selector is shown. Use -- before a
 remote name that begins with a dash. Options are persisted in each generated
-service; rerun the command for that remote to change them.
+service. `configure` makes a single-remote update explicit; omitted options are
+reset to their documented defaults. `list` maps remote names to units,
+mountpoints and their current state.
 EOF
 }
 
 parse_options() {
+    ACTION=install
     SELECT_ALL=0
     PRUNE_ONLY=0
     MOUNTPOINT=
@@ -249,6 +255,13 @@ parse_options() {
     SHUTDOWN_TIMEOUT=30m
     MOUNT_OPTIONS_SET=0
     REMOTE_ARGS=()
+
+    case "${1-}" in
+        install|configure|list)
+            ACTION=$1
+            shift
+            ;;
+    esac
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -320,6 +333,12 @@ parse_options() {
     fi
     if [ "$SELECT_ALL" -eq 1 ] && [ "${#REMOTE_ARGS[@]}" -gt 0 ]; then
         echo "Error: --all cannot be combined with remote names." >&2
+        return 1
+    fi
+    if [ "$ACTION" = list ] &&
+       { [ "$SELECT_ALL" -eq 1 ] || [ "${#REMOTE_ARGS[@]}" -gt 0 ] ||
+         [ "$PRUNE_ONLY" -eq 1 ] || [ "$MOUNT_OPTIONS_SET" -eq 1 ]; }; then
+        echo "Error: list does not accept remote selections or mount options." >&2
         return 1
     fi
     if [ "$MOUNTPOINT_SET" -eq 1 ]; then
@@ -459,6 +478,11 @@ validate_selection_options() {
         echo "Error: --mountpoint requires exactly one selected remote." >&2
         return 1
     fi
+    if [ "${ACTION:-install}" = configure ] &&
+       [ "${#SELECTED_REMOTES[@]}" -ne 1 ]; then
+        echo "Error: configure requires exactly one remote." >&2
+        return 1
+    fi
 }
 
 escape_systemd_exec_value() {
@@ -473,6 +497,20 @@ escape_systemd_exec_value() {
     value=${value//\"/\\\"}
     value=${value//%/%%}
     value=${value//\$/\$\$}
+    printf '%s' "$value"
+}
+
+escape_systemd_text_value() {
+    local value=$1
+    case "$value" in
+        *$'\n'*|*$'\r'*)
+            echo "Error: systemd values cannot contain line breaks." >&2
+            return 1
+            ;;
+    esac
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//%/%%}
     printf '%s' "$value"
 }
 
@@ -493,7 +531,7 @@ config_digest() {
     printf '%s\n' "$digest"
 }
 
-service_unit() {
+mount_digest() {
     local digest
     digest=$(printf '%s\0%s\0' "$CONFIG_PATH" "$1" | sha256sum) || return 1
     digest=${digest%% *}
@@ -507,7 +545,28 @@ service_unit() {
             return 1
             ;;
     esac
-    printf 'rclone-%s.service\n' "${digest:0:24}"
+    printf '%s\n' "$digest"
+}
+
+mount_storage_id() {
+    local digest
+    digest=$(mount_digest "$1") || return 1
+    printf 'rclone-%s\n' "${digest:0:24}"
+}
+
+service_unit() {
+    local remote=$1 digest escaped candidate
+    local LC_ALL=C
+    digest=$(mount_digest "$remote") || return 1
+    escaped=$(systemd-escape -- "$remote") || return 1
+    candidate="rclone@${escaped}-${digest:0:12}.service"
+    if [ "${#candidate}" -le 255 ]; then
+        printf '%s\n' "$candidate"
+    else
+        # systemd-escape can expand a long Unicode name to several times its
+        # input length. Keep the exceptional fallback valid and collision-safe.
+        printf 'rclone@remote-%s.service\n' "${digest:0:24}"
+    fi
 }
 
 find_fusermount() {
@@ -515,6 +574,8 @@ find_fusermount() {
     for candidate in /usr/bin/fusermount3 /bin/fusermount3 \
                      /usr/bin/fusermount /bin/fusermount; do
         if [ -x "$candidate" ]; then
+            FUSERMOUNT_BIN=$candidate
+            printf '%s\n' "$candidate"
             return 0
         fi
     done
@@ -531,7 +592,11 @@ check_fuse() {
         echo "Error: The current user cannot access /dev/fuse." >&2
         return 1
     fi
-    find_fusermount
+    find_fusermount >/dev/null || return 1
+    FINDMNT_BIN=$(type -P findmnt) || {
+        echo "Error: findmnt from util-linux is required." >&2
+        return 1
+    }
 }
 
 unit_directory() {
@@ -557,29 +622,32 @@ runtime_root() {
 }
 
 mountpoint_for() {
-    local unit=$1
+    local remote=$1 storage_id
     if [ "${MOUNTPOINT_SET:-0}" -eq 1 ]; then
         printf '%s\n' "$MOUNTPOINT"
     else
-        printf '%s/mnt/%s\n' "$HOME" "${unit%.service}"
+        storage_id=$(mount_storage_id "$remote") || return 1
+        printf '%s/mnt/%s\n' "$HOME" "$storage_id"
     fi
 }
 
 write_unit_file() {
     local remote=$1 unit=$2 unit_dir unit_file temporary_unit
     local rclone_exec config_exec source_exec mount_exec cache_exec runtime_exec socket_exec
-    local stop_exec timeout_exec
-    local source mountpoint cache_dir runtime_dir rc_socket config_sha read_only
-    local stop_script
+    local fusermount_exec findmnt_exec stop_exec cleanup_exec timeout_exec device_exec
+    local source mountpoint cache_dir runtime_dir rc_socket config_sha read_only storage_id device_name
+    local stop_script cleanup_script description_exec
     # An invocation-only XDG_CONFIG_HOME may not be in the running user
     # manager's search path. This conventional directory is stable.
     unit_dir=$(unit_directory) || return 1
     unit_file="$unit_dir/$unit"
     mkdir -p -- "$unit_dir" || return 1
     source="$remote:${SUBDIR#/}"
-    mountpoint=$(mountpoint_for "$unit") || return 1
-    cache_dir="$(cache_root)/${unit%.service}"
-    runtime_dir="$(runtime_root)/${unit%.service}"
+    storage_id=$(mount_storage_id "$remote") || return 1
+    device_name="rclone-mount-service:$storage_id"
+    mountpoint=$(mountpoint_for "$remote") || return 1
+    cache_dir="$(cache_root)/$storage_id"
+    runtime_dir="$(runtime_root)/$storage_id"
     rc_socket="$runtime_dir/rc.sock"
     config_sha=$(config_digest) || return 1
     if [ "${READ_ONLY:-0}" -eq 1 ]; then
@@ -594,18 +662,35 @@ write_unit_file() {
     cache_exec=$(escape_systemd_exec_value "$cache_dir") || return 1
     runtime_exec=$(escape_systemd_exec_value "$runtime_dir") || return 1
     socket_exec=$(escape_systemd_exec_value "$rc_socket") || return 1
+    if [ -z "${FUSERMOUNT_BIN:-}" ]; then
+        find_fusermount >/dev/null || return 1
+    fi
+    if [ -z "${FINDMNT_BIN:-}" ]; then
+        FINDMNT_BIN=$(type -P findmnt) || return 1
+    fi
+    fusermount_exec=$(escape_systemd_exec_value "$FUSERMOUNT_BIN") || return 1
+    findmnt_exec=$(escape_systemd_exec_value "$FINDMNT_BIN") || return 1
+    device_exec=$(escape_systemd_exec_value "$device_name") || return 1
     timeout_exec=$(escape_systemd_exec_value "${SHUTDOWN_TIMEOUT:-30m}") || return 1
+    description_exec=$(escape_systemd_text_value "$source") || return 1
     # Expanded later by the bash process started from the generated unit.
     # shellcheck disable=SC2016
-    stop_script='empty=0; while queue=$("$1" rc --unix-socket "$2" vfs/queue 2>/dev/null); do if [[ $queue == *'"'"'"name"'"'"'* ]]; then empty=0; else ((empty += 1)); ((empty >= 2)) && exit 0; fi; sleep 1; done; echo "Warning: unable to inspect the Rclone VFS upload queue; cached writes will resume on the next start." >&2; exit 0'
+    stop_script='empty=0; drained=0; while queue=$("$1" rc --unix-socket "$2" vfs/queue 2>/dev/null); do if [[ $queue == *'"'"'"name"'"'"'* ]]; then empty=0; else ((empty += 1)); if (( empty >= 2 )); then drained=1; break; fi; fi; sleep 1; done; (( drained == 1 )) || echo "Warning: unable to confirm an empty Rclone VFS upload queue; cached writes will resume on the next start." >&2; if [[ $3 =~ ^[1-9][0-9]*$ ]]; then kill -TERM "$3" 2>/dev/null || true; fi'
+    # A foreground Rclone normally unmounts on SIGTERM. If it exits without
+    # detaching FUSE (for example a busy or wedged mount), try a normal unmount
+    # and finally a lazy detach so a dead mount is not left behind.
+    # shellcheck disable=SC2016
+    cleanup_script='source=$("$1" --noheadings --raw --output SOURCE --mountpoint "$2" 2>/dev/null) || exit 0; if [[ $source == "$3" ]]; then "$4" -u "$2" || "$4" -uz "$2"; else echo "Warning: refusing to unmount $2 because it is owned by ${source:-an unknown filesystem}." >&2; fi'
     stop_exec=$(escape_systemd_exec_value "$stop_script") || return 1
-    temporary_unit=$(mktemp "$unit_dir/.${unit}.XXXXXX") || return 1
+    cleanup_exec=$(escape_systemd_exec_value "$cleanup_script") || return 1
+    temporary_unit=$(mktemp "$unit_dir/.rclone-mount-service.XXXXXX") || return 1
 
     if ! cat > "$temporary_unit" <<EOF
 # Managed by rclone-mount-service
 # Config-SHA256=$config_sha
+# Mountpoint=$mountpoint
 [Unit]
-Description=Rclone remote mount ${unit%.service}
+Description="Rclone mount $description_exec"
 Documentation=man:rclone(1)
 After=network-online.target
 Wants=network-online.target
@@ -618,6 +703,7 @@ ExecStartPre=/bin/rm -f -- "$socket_exec"
 ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --config "$config_exec" \\
         --cache-dir "$cache_exec" \\
+        --devname "$device_exec" \\
         --rc \\
         --rc-addr "unix://$socket_exec" \\
         --vfs-cache-mode "${VFS_CACHE_MODE:-full}" \\
@@ -626,7 +712,9 @@ ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --log-level INFO \\
         --umask 077 \\
         -- "$source_exec" "$mount_exec"
-ExecStop=/bin/bash -c "$stop_exec" -- "$rclone_exec" "$socket_exec"
+ExecStop=/bin/bash -c "$stop_exec" -- "$rclone_exec" "$socket_exec" "\$MAINPID"
+ExecStopPost=/bin/bash -c "$cleanup_exec" -- "$findmnt_exec" "$mount_exec" "$device_exec" "$fusermount_exec"
+KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=1m
 TimeoutStopSec=$timeout_exec
@@ -670,7 +758,7 @@ enable_selected_remotes() {
             failed=1
             continue
         }
-        mountpoint=$(mountpoint_for "$unit") || {
+        mountpoint=$(mountpoint_for "$remote") || {
             failed=1
             continue
         }
@@ -688,6 +776,36 @@ enable_selected_remotes() {
         fi
     done
     return "$failed"
+}
+
+unit_mountpoint() {
+    local unit=$1 remote=$2 unit_file value
+    unit_file="$(unit_directory)/$unit"
+    if [ -r "$unit_file" ]; then
+        value=$(sed -n 's/^# Mountpoint=//p' "$unit_file" | head -n 1)
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+    mountpoint_for "$remote"
+}
+
+list_mounts() {
+    local remote unit unit_file state mountpoint
+    printf 'REMOTE\tUNIT\tSTATE\tMOUNTPOINT\n'
+    for remote in "${AVAILABLE_REMOTES[@]}"; do
+        unit=$(service_unit "$remote") || return 1
+        unit_file="$(unit_directory)/$unit"
+        if [ -f "$(unit_directory)/$unit" ]; then
+            state=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+            [ -n "$state" ] || state=unknown
+        else
+            state=not-installed
+        fi
+        mountpoint=$(unit_mountpoint "$unit" "$remote") || return 1
+        printf '%s:\t%s\t%s\t%s\n' "$remote" "$unit" "$state" "$mountpoint"
+    done
 }
 
 unit_is_expected() {
@@ -709,7 +827,7 @@ prune_orphaned_units() {
         return 0
     }
 
-    for unit_file in "$unit_dir"/rclone-*.service; do
+    for unit_file in "$unit_dir"/rclone-*.service "$unit_dir"/rclone@*.service; do
         [ -f "$unit_file" ] || continue
         {
             IFS= read -r marker
@@ -762,6 +880,14 @@ main() {
     }
     resolve_config_path || return 1
     load_remotes || return 1
+    command -v systemd-escape >/dev/null || {
+        echo "Error: systemd-escape is required." >&2
+        return 1
+    }
+    if [ "$ACTION" = list ]; then
+        list_mounts
+        return $?
+    fi
     if [ "$PRUNE_ONLY" -eq 1 ]; then
         prune_orphaned_units
         return $?

@@ -7,6 +7,9 @@ Notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Explicit single-remote `configure` and remote-to-unit `list` commands.
+- Readable, bounded `rclone@<remote>-<id>.service` names.
+- Post-stop FUSE verification with normal and lazy-unmount cleanup fallbacks.
 - Per-mount subdirectory, mountpoint, read-only and VFS cache options.
 - Explicit isolated cache directories for every generated service.
 - FUSE availability checks and safe orphaned-unit cleanup with `--prune`.
@@ -18,6 +21,8 @@ Notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Stop handling now explicitly signals Rclone after the VFS queue drains and
+  verifies that the FUSE mount actually disappeared.
 - Rclone output is written only to journald; unmanaged `/tmp` log files are no
   longer created.
 - Services rely on Rclone's foreground SIGTERM handling instead of a hard-coded
