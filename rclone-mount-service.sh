@@ -4,7 +4,7 @@
 
 # Return the current distribution and its parent families.
 distribution_ids() (
-    local ID= ID_LIKE=
+    local ID='' ID_LIKE=''
     if [ -r /etc/os-release ]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -15,7 +15,7 @@ distribution_ids() (
 # Print: package manager, package format, official Rclone architecture.
 # Return failure when there is no supported package route.
 rclone_package() {
-    local distro_ids distro manager= format= arch
+    local distro_ids distro manager='' format='' arch
     distro_ids=$(distribution_ids) || return 1
     # Intentional word splitting: ID_LIKE is a space-separated list.
     # shellcheck disable=SC2086
@@ -78,7 +78,7 @@ download_file() {
 }
 
 verify_release_checksum() {
-    local artifact=$1 sums_file=$2 expected_name=$3 hash name expected= actual
+    local artifact=$1 sums_file=$2 expected_name=$3 hash name expected='' actual
     while IFS=' ' read -r hash name; do
         if [ "$name" = "$expected_name" ]; then
             expected=$hash
