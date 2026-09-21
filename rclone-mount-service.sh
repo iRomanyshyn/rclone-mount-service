@@ -593,8 +593,8 @@ check_fuse() {
         return 1
     fi
     find_fusermount >/dev/null || return 1
-    MOUNTPOINT_BIN=$(type -P mountpoint) || {
-        echo "Error: mountpoint from util-linux is required." >&2
+    FINDMNT_BIN=$(type -P findmnt) || {
+        echo "Error: findmnt from util-linux is required." >&2
         return 1
     }
 }
@@ -634,8 +634,8 @@ mountpoint_for() {
 write_unit_file() {
     local remote=$1 unit=$2 unit_dir unit_file temporary_unit
     local rclone_exec config_exec source_exec mount_exec cache_exec runtime_exec socket_exec
-    local fusermount_exec mountpoint_bin_exec stop_exec cleanup_exec timeout_exec
-    local source mountpoint cache_dir runtime_dir rc_socket config_sha read_only storage_id
+    local fusermount_exec findmnt_exec stop_exec cleanup_exec timeout_exec device_exec
+    local source mountpoint cache_dir runtime_dir rc_socket config_sha read_only storage_id device_name
     local stop_script cleanup_script description_exec
     # An invocation-only XDG_CONFIG_HOME may not be in the running user
     # manager's search path. This conventional directory is stable.
@@ -644,6 +644,7 @@ write_unit_file() {
     mkdir -p -- "$unit_dir" || return 1
     source="$remote:${SUBDIR#/}"
     storage_id=$(mount_storage_id "$remote") || return 1
+    device_name="rclone-mount-service:$storage_id"
     mountpoint=$(mountpoint_for "$remote") || return 1
     cache_dir="$(cache_root)/$storage_id"
     runtime_dir="$(runtime_root)/$storage_id"
@@ -664,11 +665,12 @@ write_unit_file() {
     if [ -z "${FUSERMOUNT_BIN:-}" ]; then
         find_fusermount >/dev/null || return 1
     fi
-    if [ -z "${MOUNTPOINT_BIN:-}" ]; then
-        MOUNTPOINT_BIN=$(type -P mountpoint) || return 1
+    if [ -z "${FINDMNT_BIN:-}" ]; then
+        FINDMNT_BIN=$(type -P findmnt) || return 1
     fi
     fusermount_exec=$(escape_systemd_exec_value "$FUSERMOUNT_BIN") || return 1
-    mountpoint_bin_exec=$(escape_systemd_exec_value "$MOUNTPOINT_BIN") || return 1
+    findmnt_exec=$(escape_systemd_exec_value "$FINDMNT_BIN") || return 1
+    device_exec=$(escape_systemd_exec_value "$device_name") || return 1
     timeout_exec=$(escape_systemd_exec_value "${SHUTDOWN_TIMEOUT:-30m}") || return 1
     description_exec=$(escape_systemd_text_value "$source") || return 1
     # Expanded later by the bash process started from the generated unit.
@@ -678,10 +680,10 @@ write_unit_file() {
     # detaching FUSE (for example a busy or wedged mount), try a normal unmount
     # and finally a lazy detach so a dead mount is not left behind.
     # shellcheck disable=SC2016
-    cleanup_script='if "$1" -q -- "$2"; then "$3" -u "$2" || "$3" -uz "$2"; fi'
+    cleanup_script='source=$("$1" --noheadings --raw --output SOURCE --mountpoint "$2" 2>/dev/null) || exit 0; if [[ $source == "$3" ]]; then "$4" -u "$2" || "$4" -uz "$2"; else echo "Warning: refusing to unmount $2 because it is owned by ${source:-an unknown filesystem}." >&2; fi'
     stop_exec=$(escape_systemd_exec_value "$stop_script") || return 1
     cleanup_exec=$(escape_systemd_exec_value "$cleanup_script") || return 1
-    temporary_unit=$(mktemp "$unit_dir/.${unit}.XXXXXX") || return 1
+    temporary_unit=$(mktemp "$unit_dir/.rclone-mount-service.XXXXXX") || return 1
 
     if ! cat > "$temporary_unit" <<EOF
 # Managed by rclone-mount-service
@@ -701,6 +703,7 @@ ExecStartPre=/bin/rm -f -- "$socket_exec"
 ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --config "$config_exec" \\
         --cache-dir "$cache_exec" \\
+        --devname "$device_exec" \\
         --rc \\
         --rc-addr "unix://$socket_exec" \\
         --vfs-cache-mode "${VFS_CACHE_MODE:-full}" \\
@@ -710,7 +713,7 @@ ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --umask 077 \\
         -- "$source_exec" "$mount_exec"
 ExecStop=/bin/bash -c "$stop_exec" -- "$rclone_exec" "$socket_exec" "\$MAINPID"
-ExecStopPost=/bin/bash -c "$cleanup_exec" -- "$mountpoint_bin_exec" "$mount_exec" "$fusermount_exec"
+ExecStopPost=/bin/bash -c "$cleanup_exec" -- "$findmnt_exec" "$mount_exec" "$device_exec" "$fusermount_exec"
 KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=1m
