@@ -12,7 +12,9 @@ Contributions and suggestions for portable mount defaults are welcome.
 - Interactive, explicit or `--all` remote selection.
 - One isolated service and VFS cache per config-path/remote pair.
 - Optional subdirectory, custom mountpoint, read-only mode and VFS settings.
+- Readable `rclone@...` unit names and a `list` command mapping them to remotes.
 - Bounded shutdown wait for queued VFS uploads, with restart-safe recovery.
+- FUSE cleanup after stop, including a lazy-unmount fallback for stuck mounts.
 - Logs in journald instead of unmanaged files under `/tmp`.
 - Safe cleanup of managed services whose remotes were deleted.
 - Official DEB/RPM installation with SHA-256 verification when Rclone is absent.
@@ -23,7 +25,7 @@ Contributions and suggestions for portable mount defaults are welcome.
 - Linux with a running systemd user manager.
 - Bash, `sha256sum` and Python 3 for the test suite.
 - FUSE through `/dev/fuse`, plus `fusermount3` or `fusermount` under `/usr/bin`
-  or `/bin`.
+  or `/bin`; `mountpoint` and `systemd-escape` from the system utilities.
 - Rclone 1.68 or newer, supporting `listremotes --source file`, the VFS queue
   remote-control call and RC Unix sockets.
 - `curl` or `wget` and `sudo` only when the script must install Rclone.
@@ -57,11 +59,13 @@ silently mounts everything.
 
 ## Per-mount options
 
-Options supplied during a run are stored in the generated service. Run the
-script again for a remote to replace its previous settings and restart it.
+Options supplied during a run are stored in the generated service. Use the
+explicit `configure` command once for each remote that needs different settings.
+It accepts exactly one remote and restarts only that remote. Omitted options are
+reset to the defaults shown below.
 
 ```sh
-./rclone-mount-service.sh \
+./rclone-mount-service.sh configure \
   --subdir "Photos/Library" \
   --mountpoint "$HOME/mnt/photos" \
   --read-only \
@@ -69,6 +73,11 @@ script again for a remote to replace its previous settings and restart it.
   --vfs-cache-max-size 10G \
   --shutdown-timeout 2h \
   "Google Drive"
+
+./rclone-mount-service.sh configure \
+  --mountpoint "$HOME/mnt/archive" \
+  --read-only \
+  Archive:
 ```
 
 | Option | Meaning |
@@ -94,13 +103,22 @@ excluded because their environment would not automatically exist in the user
 service.
 
 The script creates one concrete unit for each absolute config-path/remote pair
-under `~/.config/systemd/user`. Its bounded ID is derived from SHA-256, for
-example `rclone-0123456789abcdef01234567.service`. Consequently:
+under `~/.config/systemd/user`. Normal names keep the familiar instance-unit
+form and include the escaped remote name, for example
+`rclone@Google\x20Drive-0123456789ab.service`. The short suffix is derived from
+both the config path and remote, so identically named remotes in different
+configs remain separate. Exceptionally long escaped names use a bounded hashed
+fallback. Consequently:
 
 - separate config files cannot overwrite each other's services;
 - very long and Unicode remote names remain valid;
 - changing options for a remote updates the same predictable unit;
 - each service receives an explicit absolute `--config` path.
+
+Upgrading from the opaque `rclone-<24-hex-id>.service` naming automatically
+stops and removes that managed legacy unit when the corresponding remote is
+configured again. Its mountpoint and cache identifier stay unchanged so queued
+VFS writes are not abandoned during the rename.
 
 Each unit also receives an explicit isolated cache directory under
 `$XDG_CACHE_HOME/rclone-mount-service/`, or `~/.cache/rclone-mount-service/`
@@ -120,14 +138,21 @@ Rclone configs are left untouched.
 
 ## Service operation and logs
 
-The script prints the exact service name and mountpoint after every successful
-start. Common commands are:
+Show the exact mapping between configured remotes, installed units, state and
+mountpoints:
 
 ```sh
-systemctl --user status rclone-0123456789abcdef01234567.service
-journalctl --user-unit=rclone-0123456789abcdef01234567.service -f
-systemctl --user restart rclone-0123456789abcdef01234567.service
-systemctl --user disable --now rclone-0123456789abcdef01234567.service
+./rclone-mount-service.sh list
+```
+
+The script also prints the exact service name and mountpoint after every
+successful start. Common commands are:
+
+```sh
+systemctl --user status 'rclone@Google\x20Drive-0123456789ab.service'
+journalctl --user-unit='rclone@Google\x20Drive-0123456789ab.service' -f
+systemctl --user restart 'rclone@Google\x20Drive-0123456789ab.service'
+systemctl --user disable --now 'rclone@Google\x20Drive-0123456789ab.service'
 ```
 
 Rclone runs in the foreground with `Type=notify`; systemd waits until the mount
@@ -140,7 +165,15 @@ With VFS cache mode `writes` or `full`, an application can finish a local copy
 while Rclone is still uploading the closed file. Each service exposes only its
 VFS queue through an RC Unix socket inside the user's runtime directory. Before
 a stop, restart or normal shutdown, `ExecStop` waits for that queue to remain
-empty. `--shutdown-timeout` bounds the wait; the default is `30m`.
+empty, then explicitly sends SIGTERM to Rclone. `--shutdown-timeout` bounds the
+whole stop operation; the default is `30m`.
+
+Foreground Rclone normally removes its FUSE mount when it receives SIGTERM, but
+upstream notes that unmount can fail when a mountpoint is busy. `ExecStopPost`
+therefore checks the mount table after Rclone exits, tries a normal
+`fusermount3 -u`/`fusermount -u`, and finally performs a lazy detach if the
+normal unmount fails. A lazy detach immediately removes the path from the mount
+namespace while the kernel releases any remaining references later.
 
 If the timeout expires, the network fails or power is lost, Rclone's persistent
 isolated cache is retained. According to the
