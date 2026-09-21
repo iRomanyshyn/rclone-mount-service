@@ -192,12 +192,16 @@ class RemoteTests(unittest.TestCase):
             identifier = storage_id(config, remote)
             self.assertIn(f'"{env["HOME"]}/mnt/{identifier}"', contents)
             self.assertIn('--cache-dir "', contents)
+            self.assertIn(
+                f'--devname "rclone-mount-service:{identifier}"', contents)
             self.assertIn('--read-only=false', contents)
             self.assertIn('--rc-addr "unix://', contents)
             self.assertNotIn('--log-file', contents)
             self.assertIn('ExecStop=/bin/bash -c ', contents)
             self.assertIn('kill -TERM', contents)
             self.assertIn('ExecStopPost=/bin/bash -c ', contents)
+            self.assertIn('--output SOURCE --mountpoint', contents)
+            self.assertIn('refusing to unmount', contents)
             self.assertIn(' -uz ', contents)
             self.assertIn('TimeoutStopSec=30m', contents)
             verify = subprocess.run(
@@ -240,6 +244,26 @@ class RemoteTests(unittest.TestCase):
             result.stdout.strip(), service_unit("/tmp/rclone.conf", long_remote))
         self.assertLessEqual(len(result.stdout.strip().encode()), 255)
         self.assertTrue(result.stdout.strip().startswith("rclone@remote-"))
+
+    def test_near_name_max_unit_uses_short_temporary_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            config = root / "rclone.conf"
+            rclone = root / "rclone"
+            config.touch()
+            rclone.touch()
+            remote = "x" * 222
+            unit_name = service_unit(config, remote)
+            self.assertGreaterEqual(len(unit_name.encode()), 248)
+            result = run_bash(
+                'RCLONE_BIN="$1"; CONFIG_PATH="$2"; '
+                'unit=$(service_unit "$3") || exit; '
+                'write_unit_file "$3" "$unit" || exit; printf "%s\n" "$unit"',
+                args=(str(rclone), str(config), remote), env={"HOME": str(home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), unit_name)
+            self.assertTrue((home / ".config/systemd/user" / unit_name).is_file())
 
     def test_per_mount_options_and_isolated_cache_are_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
