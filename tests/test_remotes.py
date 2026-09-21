@@ -17,8 +17,8 @@ def mount_digest(config, remote):
     return hashlib.sha256(payload).hexdigest()
 
 
-def legacy_unit(config, remote):
-    return f"rclone-{mount_digest(config, remote)[:24]}.service"
+def storage_id(config, remote):
+    return f"rclone-{mount_digest(config, remote)[:24]}"
 
 
 def service_unit(config, remote):
@@ -189,8 +189,8 @@ class RemoteTests(unittest.TestCase):
             self.assertIn('Description="Rclone mount -Google $Drive%%:"', contents)
             self.assertIn('-- "-Google $$Drive%%:"', contents)
             self.assertIn('--config "', contents)
-            storage_id = legacy_unit(config, remote)[:-8]
-            self.assertIn(f'"{env["HOME"]}/mnt/{storage_id}"', contents)
+            identifier = storage_id(config, remote)
+            self.assertIn(f'"{env["HOME"]}/mnt/{identifier}"', contents)
             self.assertIn('--cache-dir "', contents)
             self.assertIn('--read-only=false', contents)
             self.assertIn('--rc-addr "unix://', contents)
@@ -269,9 +269,9 @@ class RemoteTests(unittest.TestCase):
             self.assertIn('--vfs-cache-max-size "2G"', contents)
             self.assertIn('--read-only=true', contents)
             self.assertIn('TimeoutStopSec=2h', contents)
-            storage_id = legacy_unit(config, "one")[:-8]
+            identifier = storage_id(config, "one")
             self.assertIn(
-                f'--cache-dir "{root}/cache/rclone-mount-service/{storage_id}"',
+                f'--cache-dir "{root}/cache/rclone-mount-service/{identifier}"',
                 contents,
             )
 
@@ -320,93 +320,6 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(
                 calls.read_text().splitlines(),
                 [f"--user disable --now {orphan}", "--user daemon-reload"],
-            )
-
-    def test_prune_keeps_current_legacy_unit_until_migration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            home = root / "home"
-            config = root / "rclone.conf"
-            config.touch()
-            remote = "current"
-            old_unit = legacy_unit(config, remote)
-            unit_dir = home / ".config/systemd/user"
-            unit_dir.mkdir(parents=True)
-            config_hash = hashlib.sha256(str(config).encode() + b"\0").hexdigest()
-            (unit_dir / old_unit).write_text(
-                "# Managed by rclone-mount-service\n"
-                f"# Config-SHA256={config_hash}\n"
-            )
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            systemctl = fake_bin / "systemctl"
-            systemctl.write_text("#!/bin/bash\nexit 99\n")
-            systemctl.chmod(0o755)
-            result = run_bash(
-                'CONFIG_PATH="$1"; AVAILABLE_REMOTES=(current); prune_orphaned_units',
-                args=(str(config),),
-                env={
-                    "HOME": str(home),
-                    "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
-                })
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue((unit_dir / old_unit).exists())
-
-    def test_legacy_unit_migration_preserves_storage_and_forces_unmount(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            home = root / "home"
-            config = root / "rclone.conf"
-            config.touch()
-            remote = "Google Drive"
-            old_unit = legacy_unit(config, remote)
-            new_unit = service_unit(config, remote)
-            unit_dir = home / ".config/systemd/user"
-            unit_dir.mkdir(parents=True)
-            config_hash = hashlib.sha256(str(config).encode() + b"\0").hexdigest()
-            (unit_dir / old_unit).write_text(
-                "# Managed by rclone-mount-service\n"
-                f"# Config-SHA256={config_hash}\n"
-            )
-            calls = root / "calls"
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            systemctl = fake_bin / "systemctl"
-            systemctl.write_text('#!/bin/bash\necho "systemctl $*" >> "$CALLS"\n')
-            systemctl.chmod(0o755)
-            mountpoint = fake_bin / "mountpoint"
-            mountpoint.write_text('#!/bin/bash\necho "mountpoint $*" >> "$CALLS"\nexit 0\n')
-            mountpoint.chmod(0o755)
-            fusermount = fake_bin / "fusermount3"
-            fusermount.write_text(
-                '#!/bin/bash\n'
-                'echo "fusermount $*" >> "$CALLS"\n'
-                '[[ "$1" == -uz ]]\n'
-            )
-            fusermount.chmod(0o755)
-            result = run_bash(
-                'CONFIG_PATH="$1"; SELECTED_REMOTES=("Google Drive"); '
-                'MOUNTPOINT_BIN="$2"; FUSERMOUNT_BIN="$3"; '
-                'migrate_legacy_units',
-                args=(str(config), str(mountpoint), str(fusermount)),
-                env={
-                    "HOME": str(home),
-                    "CALLS": str(calls),
-                    "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
-                })
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((unit_dir / old_unit).exists())
-            self.assertIn(f"Migrated {remote} from {old_unit} to {new_unit}", result.stdout)
-            storage_path = home / "mnt" / old_unit[:-8]
-            self.assertEqual(
-                calls.read_text().splitlines(),
-                [
-                    f"systemctl --user disable --now {old_unit}",
-                    f"mountpoint -q -- {storage_path}",
-                    f"fusermount -u {storage_path}",
-                    f"fusermount -uz {storage_path}",
-                    "systemctl --user daemon-reload",
-                ],
             )
 
     def test_enable_uses_stable_units_and_restarts_them(self):
@@ -490,7 +403,7 @@ class RemoteTests(unittest.TestCase):
             'select_remotes "${REMOTE_ARGS[@]}" || exit; validate_selection_options')
         self.assertNotEqual(multiple.returncode, 0)
 
-    def test_list_maps_remote_to_readable_or_legacy_unit(self):
+    def test_list_maps_remote_to_readable_unit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / "home"
