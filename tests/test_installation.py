@@ -203,6 +203,46 @@ class InstallationTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events, "")
 
+    def test_dispatching_symlink_preserves_command_name_and_absolute_path(self):
+        for path_entry in ["absolute", "launchers", "launchers with spaces", ".", ""]:
+            with self.subTest(path_entry=path_entry), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                launcher_dir = root / "launchers with spaces"
+                launcher_dir.mkdir()
+                dispatcher = root / "dispatcher"
+                dispatcher.write_text(
+                    '#!/bin/bash\n'
+                    '[[ "${0##*/}" == rclone ]] || exit 64\n'
+                    'printf "%s\\n" "$*" >> "$CALLS"\n'
+                )
+                dispatcher.chmod(0o755)
+                launcher = launcher_dir / "rclone"
+                launcher.symlink_to(dispatcher)
+                # Also exercise a symlinked PATH directory, without replacing
+                # the final command symlink with its dispatcher target.
+                (root / "launchers").symlink_to(launcher_dir, target_is_directory=True)
+                cwd = launcher_dir if path_entry in [".", ""] else root
+                entry = str(launcher_dir) if path_entry == "absolute" else path_entry
+                env = dict(os.environ, SCRIPT=str(SCRIPT), CALLS=str(root / "calls"),
+                           PATH=entry + os.pathsep + os.environ["PATH"])
+                result = subprocess.run(
+                    ["/bin/bash", "-c", '''
+source "$SCRIPT"
+install_rclone() { echo "Unexpected installation" >&2; return 99; }
+ensure_rclone || exit "$?"
+[[ "$RCLONE_BIN" == /* && -L "$RCLONE_BIN" ]] || exit 65
+# systemd may launch the saved executable from a different directory.
+cd / || exit
+"$RCLONE_BIN" mount --help || exit "$?"
+printf '%s' "$RCLONE_BIN"
+'''], cwd=cwd, env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(Path(result.stdout).name, "rclone")
+                if path_entry == "absolute":
+                    self.assertEqual(result.stdout, str(launcher))
+                self.assertEqual((root / "calls").read_text().splitlines(),
+                                 ["version", "mount --help", "mount --help"])
+
     def test_installer_success_without_binary_is_rejected(self):
         result, _ = self.run_shell("ensure_rclone", CREATE_BINARY="no")
         self.assertNotEqual(result.returncode, 0)

@@ -38,8 +38,10 @@ installation stops the process. These failures do **not** trigger a second
 installation method. The fallback also refuses to overwrite an installed
 RPM/DEB package whose executable is missing from `PATH`.
 
-After installation, the script verifies Rclone and uses its resolved absolute
-executable path in the generated service. Installing an official package from a
+After installation, the script verifies Rclone and uses its absolute command
+path in the generated service, preserving symlinks used by multicall launchers.
+Relative PATH entries are made absolute without resolving the command symlink.
+Installing an official package from a
 URL does not add an upstream APT/RPM repository or automatically configure
 future upstream updates. FUSE is still required for mounting.
 

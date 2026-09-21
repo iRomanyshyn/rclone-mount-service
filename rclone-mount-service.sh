@@ -137,8 +137,12 @@ ensure_rclone() {
         echo "Error: Rclone executable was not found after installation." >&2
         return 1
     }
-    # A systemd ExecStart needs an absolute executable path.
-    RCLONE_BIN=$(readlink -f -- "$RCLONE_BIN") || return 1
+    # systemd needs an absolute path, but the final symlink must be preserved:
+    # multicall launchers can select Rclone based on the invoked command name.
+    case "$RCLONE_BIN" in
+        /*) ;;
+        *) RCLONE_BIN="$PWD/$RCLONE_BIN" ;;
+    esac
     if ! "$RCLONE_BIN" version || ! "$RCLONE_BIN" mount --help >/dev/null; then
         echo "Error: Rclone is not working or does not support mount." >&2
         return 1
