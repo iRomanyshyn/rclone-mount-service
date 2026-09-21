@@ -113,7 +113,8 @@ class RemoteTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
         for args in [("--all", "one"), ("--prune", "one"),
-                     ("--vfs-cache-mode", "broken"), ("--mountpoint", "relative")]:
+                     ("--vfs-cache-mode", "broken"), ("--mountpoint", "relative"),
+                     ("--mountpoint", ""), ("--shutdown-timeout", "forever")]:
             with self.subTest(args=args):
                 result = run_bash('parse_options "$@"', args=args)
                 self.assertNotEqual(result.returncode, 0)
@@ -168,8 +169,10 @@ class RemoteTests(unittest.TestCase):
             self.assertIn(f'"{env["HOME"]}/mnt/{unit_name[:-8]}"', contents)
             self.assertIn('--cache-dir "', contents)
             self.assertIn('--read-only=false', contents)
+            self.assertIn('--rc-addr "unix://', contents)
             self.assertNotIn('--log-file', contents)
-            self.assertNotIn('ExecStop=', contents)
+            self.assertIn('ExecStop=/bin/bash -c ', contents)
+            self.assertIn('TimeoutStopSec=30m', contents)
             verify = subprocess.run(
                 ["systemd-analyze", "verify", "--man=no", str(unit)], text=True,
                 capture_output=True, timeout=10)
@@ -220,7 +223,8 @@ class RemoteTests(unittest.TestCase):
             result = run_bash(
                 'RCLONE_BIN="$1"; CONFIG_PATH="$2"; AVAILABLE_REMOTES=(one); '
                 'parse_options --mountpoint "$3" --subdir "nested path" '
-                '--read-only --vfs-cache-mode writes --vfs-cache-max-size 2G one || exit; '
+                '--read-only --vfs-cache-mode writes --vfs-cache-max-size 2G '
+                '--shutdown-timeout 2h one || exit; '
                 'select_remotes "${REMOTE_ARGS[@]}" || exit; '
                 'validate_selection_options || exit; write_selected_units || exit; '
                 'service_unit one',
@@ -234,13 +238,14 @@ class RemoteTests(unittest.TestCase):
             self.assertIn('--vfs-cache-mode "writes"', contents)
             self.assertIn('--vfs-cache-max-size "2G"', contents)
             self.assertIn('--read-only=true', contents)
+            self.assertIn('TimeoutStopSec=2h', contents)
             self.assertIn(
                 f'--cache-dir "{root}/cache/rclone-mount-service/{unit_name[:-8]}"',
                 contents,
             )
 
         invalid = run_bash(
-            'MOUNTPOINT=/tmp/custom; SELECTED_REMOTES=(one two); '
+            'MOUNTPOINT=/tmp/custom; MOUNTPOINT_SET=1; SELECTED_REMOTES=(one two); '
             'validate_selection_options')
         self.assertNotEqual(invalid.returncode, 0)
 

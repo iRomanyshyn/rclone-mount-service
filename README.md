@@ -12,6 +12,7 @@ Contributions and suggestions for portable mount defaults are welcome.
 - Interactive, explicit or `--all` remote selection.
 - One isolated service and VFS cache per config-path/remote pair.
 - Optional subdirectory, custom mountpoint, read-only mode and VFS settings.
+- Bounded shutdown wait for queued VFS uploads, with restart-safe recovery.
 - Logs in journald instead of unmanaged files under `/tmp`.
 - Safe cleanup of managed services whose remotes were deleted.
 - Official DEB/RPM installation with SHA-256 verification when Rclone is absent.
@@ -23,7 +24,8 @@ Contributions and suggestions for portable mount defaults are welcome.
 - Bash, `sha256sum` and Python 3 for the test suite.
 - FUSE through `/dev/fuse`, plus `fusermount3` or `fusermount` under `/usr/bin`
   or `/bin`.
-- An Rclone version supporting `rclone listremotes --source file`.
+- Rclone 1.68 or newer, supporting `listremotes --source file`, the VFS queue
+  remote-control call and RC Unix sockets.
 - `curl` or `wget` and `sudo` only when the script must install Rclone.
 
 Run the script as a regular user, never with `sudo`.
@@ -65,6 +67,7 @@ script again for a remote to replace its previous settings and restart it.
   --read-only \
   --vfs-cache-mode writes \
   --vfs-cache-max-size 10G \
+  --shutdown-timeout 2h \
   "Google Drive"
 ```
 
@@ -76,6 +79,7 @@ script again for a remote to replace its previous settings and restart it.
 | `--read-only` | Prevent writes through the mount. |
 | `--vfs-cache-mode MODE` | `off`, `minimal`, `writes` or `full`; default is `full`. |
 | `--vfs-cache-max-size SIZE` | Per-service VFS cache limit; default is `1G`. |
+| `--shutdown-timeout DURATION` | Maximum stop/restart wait for queued uploads; default is `30m`. |
 | `--prune` | Remove this config's managed services for remotes that no longer exist. |
 
 The default mountpoint is `~/mnt/rclone-<24-hex-id>`. A custom mountpoint is
@@ -127,11 +131,29 @@ systemctl --user disable --now rclone-0123456789abcdef01234567.service
 ```
 
 Rclone runs in the foreground with `Type=notify`; systemd waits until the mount
-is ready. No `ExecStop` helper is generated: according to the
-[Rclone mount documentation](https://rclone.org/commands/rclone_mount/), a
-foreground mount handles SIGINT/SIGTERM and unmounts itself. The installer still
-checks `/dev/fuse` access and the presence of `fusermount3`/`fusermount` before
-writing services.
+is ready. The installer checks `/dev/fuse` access and the presence of
+`fusermount3`/`fusermount` before writing services.
+
+### Pending writes during shutdown
+
+With VFS cache mode `writes` or `full`, an application can finish a local copy
+while Rclone is still uploading the closed file. Each service exposes only its
+VFS queue through an RC Unix socket inside the user's runtime directory. Before
+a stop, restart or normal shutdown, `ExecStop` waits for that queue to remain
+empty. `--shutdown-timeout` bounds the wait; the default is `30m`.
+
+If the timeout expires, the network fails or power is lost, Rclone's persistent
+isolated cache is retained. According to the
+[Rclone VFS documentation](https://rclone.org/commands/rclone_mount/#vfs-file-caching),
+pending cached files are uploaded when Rclone starts again with the same cache
+settings. Do not manually delete a service's cache while it may contain pending
+writes.
+
+This protects files that the writing application has closed. It cannot complete
+bytes that an application had not yet written when that application was killed;
+finish the local copy before shutting down when the whole file matters. A hard
+power loss also cannot wait, so recovery then depends on the local cache and
+filesystem remaining intact.
 
 ## Installing Rclone
 
@@ -191,3 +213,7 @@ The tests mock downloads, privilege escalation, package managers and
 services. Generated units are checked with `systemd-analyze verify`.
 
 See [CHANGELOG.md](CHANGELOG.md) for notable changes.
+
+## License
+
+This project is available under the [MIT License](LICENSE).

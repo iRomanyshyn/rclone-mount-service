@@ -10,6 +10,8 @@ Notable changes to this project are documented here. The format follows
 - Per-mount subdirectory, mountpoint, read-only and VFS cache options.
 - Explicit isolated cache directories for every generated service.
 - FUSE availability checks and safe orphaned-unit cleanup with `--prune`.
+- Bounded shutdown waiting for queued VFS uploads, with pending writes retained
+  for upload after the next start when the wait cannot finish.
 - SHA-256 verification for official DEB/RPM downloads.
 - GitHub Actions checks for Bash syntax, ShellCheck, unit tests and generated
   systemd unit validation.
@@ -22,6 +24,7 @@ Notable changes to this project are documented here. The format follows
   `fusermount` `ExecStop` path.
 - Per-remote startup errors now identify the failed unit and the relevant
   journal command.
+- Empty values passed explicitly to `--mountpoint` are rejected.
 
 ## 2026-09-21
 

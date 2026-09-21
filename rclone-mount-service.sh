@@ -185,6 +185,7 @@ install_rclone() (
 )
 
 ensure_rclone() {
+    local rc_help
     if ! command -v rclone >/dev/null; then
         install_rclone || return 1
         hash -r
@@ -201,6 +202,11 @@ ensure_rclone() {
     esac
     if ! "$RCLONE_BIN" version || ! "$RCLONE_BIN" mount --help >/dev/null; then
         echo "Error: Rclone is not working or does not support mount." >&2
+        return 1
+    fi
+    if ! rc_help=$("$RCLONE_BIN" rc --help 2>/dev/null) ||
+       [[ "$rc_help" != *--unix-socket* ]]; then
+        echo "Error: Rclone 1.68 or newer with RC Unix socket support is required." >&2
         return 1
     fi
 }
@@ -221,6 +227,7 @@ Options:
   --read-only                 Prevent writes through the mount
   --vfs-cache-mode MODE       off, minimal, writes, or full (default: full)
   --vfs-cache-max-size SIZE   Per-mount cache limit (default: 1G)
+  --shutdown-timeout DURATION Wait for queued uploads before stopping (default: 30m)
   --prune                     Remove managed units for deleted remotes
   -h, --help                  Show this help
 
@@ -234,10 +241,12 @@ parse_options() {
     SELECT_ALL=0
     PRUNE_ONLY=0
     MOUNTPOINT=
+    MOUNTPOINT_SET=0
     SUBDIR=
     READ_ONLY=0
     VFS_CACHE_MODE=full
     VFS_CACHE_MAX_SIZE=1G
+    SHUTDOWN_TIMEOUT=30m
     MOUNT_OPTIONS_SET=0
     REMOTE_ARGS=()
 
@@ -250,16 +259,17 @@ parse_options() {
             --all)
                 SELECT_ALL=1
                 ;;
-            --mountpoint|--subdir|--vfs-cache-mode|--vfs-cache-max-size)
+            --mountpoint|--subdir|--vfs-cache-mode|--vfs-cache-max-size|--shutdown-timeout)
                 [ "$#" -ge 2 ] || {
                     echo "Error: $1 requires a value." >&2
                     return 1
                 }
                 case "$1" in
-                    --mountpoint) MOUNTPOINT=$2 ;;
+                    --mountpoint) MOUNTPOINT=$2; MOUNTPOINT_SET=1 ;;
                     --subdir) SUBDIR=$2 ;;
                     --vfs-cache-mode) VFS_CACHE_MODE=$2 ;;
                     --vfs-cache-max-size) VFS_CACHE_MAX_SIZE=$2 ;;
+                    --shutdown-timeout) SHUTDOWN_TIMEOUT=$2 ;;
                 esac
                 MOUNT_OPTIONS_SET=1
                 shift
@@ -298,6 +308,10 @@ parse_options() {
         echo "Error: --vfs-cache-max-size cannot be empty." >&2
         return 1
     }
+    if [[ ! "$SHUTDOWN_TIMEOUT" =~ ^[1-9][0-9]*(ms|s|m|h|d)$ ]]; then
+        echo "Error: --shutdown-timeout must be a positive duration such as 30m or 2h." >&2
+        return 1
+    fi
     if [ "$PRUNE_ONLY" -eq 1 ] &&
        { [ "$SELECT_ALL" -eq 1 ] || [ "${#REMOTE_ARGS[@]}" -gt 0 ] ||
          [ "$MOUNT_OPTIONS_SET" -eq 1 ]; }; then
@@ -308,7 +322,11 @@ parse_options() {
         echo "Error: --all cannot be combined with remote names." >&2
         return 1
     fi
-    if [ -n "$MOUNTPOINT" ]; then
+    if [ "$MOUNTPOINT_SET" -eq 1 ]; then
+        [ -n "$MOUNTPOINT" ] || {
+            echo "Error: --mountpoint cannot be empty." >&2
+            return 1
+        }
         case "$MOUNTPOINT" in
             /*) ;;
             *)
@@ -317,7 +335,7 @@ parse_options() {
                 ;;
         esac
     fi
-    case "$MOUNTPOINT$SUBDIR$VFS_CACHE_MAX_SIZE" in
+    case "$MOUNTPOINT$SUBDIR$VFS_CACHE_MAX_SIZE$SHUTDOWN_TIMEOUT" in
         *$'\n'*|*$'\r'*)
             echo "Error: Option values cannot contain line breaks." >&2
             return 1
@@ -437,7 +455,7 @@ select_remotes() {
 }
 
 validate_selection_options() {
-    if [ -n "${MOUNTPOINT:-}" ] && [ "${#SELECTED_REMOTES[@]}" -ne 1 ]; then
+    if [ "${MOUNTPOINT_SET:-0}" -eq 1 ] && [ "${#SELECTED_REMOTES[@]}" -ne 1 ]; then
         echo "Error: --mountpoint requires exactly one selected remote." >&2
         return 1
     fi
@@ -529,9 +547,18 @@ cache_root() {
     printf '%s/rclone-mount-service\n' "$root"
 }
 
+runtime_root() {
+    local root=${XDG_RUNTIME_DIR:-/run/user/$UID}
+    case "$root" in
+        /*) ;;
+        *) root="$PWD/$root" ;;
+    esac
+    printf '%s/rclone-mount-service\n' "$root"
+}
+
 mountpoint_for() {
     local unit=$1
-    if [ -n "${MOUNTPOINT:-}" ]; then
+    if [ "${MOUNTPOINT_SET:-0}" -eq 1 ]; then
         printf '%s\n' "$MOUNTPOINT"
     else
         printf '%s/mnt/%s\n' "$HOME" "${unit%.service}"
@@ -540,8 +567,10 @@ mountpoint_for() {
 
 write_unit_file() {
     local remote=$1 unit=$2 unit_dir unit_file temporary_unit
-    local rclone_exec config_exec source_exec mount_exec cache_exec
-    local source mountpoint cache_dir config_sha read_only
+    local rclone_exec config_exec source_exec mount_exec cache_exec runtime_exec socket_exec
+    local stop_exec timeout_exec
+    local source mountpoint cache_dir runtime_dir rc_socket config_sha read_only
+    local stop_script
     # An invocation-only XDG_CONFIG_HOME may not be in the running user
     # manager's search path. This conventional directory is stable.
     unit_dir=$(unit_directory) || return 1
@@ -550,6 +579,8 @@ write_unit_file() {
     source="$remote:${SUBDIR#/}"
     mountpoint=$(mountpoint_for "$unit") || return 1
     cache_dir="$(cache_root)/${unit%.service}"
+    runtime_dir="$(runtime_root)/${unit%.service}"
+    rc_socket="$runtime_dir/rc.sock"
     config_sha=$(config_digest) || return 1
     if [ "${READ_ONLY:-0}" -eq 1 ]; then
         read_only=true
@@ -561,6 +592,11 @@ write_unit_file() {
     source_exec=$(escape_systemd_exec_value "$source") || return 1
     mount_exec=$(escape_systemd_exec_value "$mountpoint") || return 1
     cache_exec=$(escape_systemd_exec_value "$cache_dir") || return 1
+    runtime_exec=$(escape_systemd_exec_value "$runtime_dir") || return 1
+    socket_exec=$(escape_systemd_exec_value "$rc_socket") || return 1
+    timeout_exec=$(escape_systemd_exec_value "${SHUTDOWN_TIMEOUT:-30m}") || return 1
+    stop_script='empty=0; while queue=$("$1" rc --unix-socket "$2" vfs/queue 2>/dev/null); do if [[ $queue == *'"'"'"name"'"'"'* ]]; then empty=0; else ((empty += 1)); ((empty >= 2)) && exit 0; fi; sleep 1; done; echo "Warning: unable to inspect the Rclone VFS upload queue; cached writes will resume on the next start." >&2; exit 0'
+    stop_exec=$(escape_systemd_exec_value "$stop_script") || return 1
     temporary_unit=$(mktemp "$unit_dir/.${unit}.XXXXXX") || return 1
 
     if ! cat > "$temporary_unit" <<EOF
@@ -575,19 +611,23 @@ Wants=network-online.target
 [Service]
 Type=notify
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStartPre=/bin/mkdir -p -- "$mount_exec" "$cache_exec"
+ExecStartPre=/bin/mkdir -p -- "$mount_exec" "$cache_exec" "$runtime_exec"
+ExecStartPre=/bin/rm -f -- "$socket_exec"
 ExecStart=/usr/bin/env -- "$rclone_exec" mount \\
         --config "$config_exec" \\
         --cache-dir "$cache_exec" \\
+        --rc \\
+        --rc-addr "unix://$socket_exec" \\
         --vfs-cache-mode "${VFS_CACHE_MODE:-full}" \\
         --vfs-cache-max-size "${VFS_CACHE_MAX_SIZE:-1G}" \\
         --read-only=$read_only \\
         --log-level INFO \\
         --umask 077 \\
         -- "$source_exec" "$mount_exec"
+ExecStop=/bin/bash -c "$stop_exec" -- "$rclone_exec" "$socket_exec"
 Restart=on-failure
 RestartSec=1m
-TimeoutStopSec=30s
+TimeoutStopSec=$timeout_exec
 StandardOutput=journal
 StandardError=journal
 

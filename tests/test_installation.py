@@ -94,6 +94,10 @@ if [[ "$1" == version ]]; then
     echo 'rclone test binary'
     exit "${VERSION_STATUS:-0}"
 fi
+if [[ "$1" == rc && "$2" == --help ]]; then
+    [[ "$RC_SUPPORT" == yes ]] && echo '  --unix-socket string'
+    exit 0
+fi
 exit "${MOUNT_STATUS:-0}"
 BINARY
         chmod +x "$STATE/bin/rclone"
@@ -118,12 +122,20 @@ class InstallationTests(unittest.TestCase):
                        VERSION_TEXT="rclone v1.75.1",
                        PACKAGE_INSTALLED="no", EXISTING="no",
                        CREATE_BINARY="yes", VERSION_STATUS="0", MOUNT_STATUS="0")
+            env["RC_SUPPORT"] = "yes"
             env.update(overrides)
             env["PATH"] = str(root / "bin") + os.pathsep + os.environ["PATH"]
             if env["EXISTING"] == "yes":
                 binary = root / "bin/rclone"
-                binary.write_text('#!/bin/bash\nif [[ "$1" == version ]]; then\n'
-                                  'exit "$VERSION_STATUS"\nfi\nexit "$MOUNT_STATUS"\n')
+                binary.write_text(
+                    '#!/bin/bash\n'
+                    'if [[ "$1" == version ]]; then exit "$VERSION_STATUS"; fi\n'
+                    'if [[ "$1" == rc && "$2" == --help ]]; then\n'
+                    '  [[ "$RC_SUPPORT" == yes ]] && echo "  --unix-socket string"\n'
+                    '  exit 0\n'
+                    'fi\n'
+                    'exit "$MOUNT_STATUS"\n'
+                )
                 binary.chmod(0o755)
             result = subprocess.run(["bash", "-c", MOCKS + "\n" + code],
                                     env=env, input=answer, text=True,
@@ -256,6 +268,11 @@ class InstallationTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(events, "")
 
+        result, events = self.run_shell("ensure_rclone", EXISTING="yes", RC_SUPPORT="no")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("1.68 or newer", result.stderr)
+        self.assertEqual(events, "")
+
     def test_dispatching_symlink_preserves_command_name_and_absolute_path(self):
         for path_entry in ["absolute", "launchers", "launchers with spaces", ".", ""]:
             with self.subTest(path_entry=path_entry), tempfile.TemporaryDirectory() as directory:
@@ -267,6 +284,9 @@ class InstallationTests(unittest.TestCase):
                     '#!/bin/bash\n'
                     '[[ "${0##*/}" == rclone ]] || exit 64\n'
                     'printf "%s\\n" "$*" >> "$CALLS"\n'
+                    'if [[ "$1" == rc && "$2" == --help ]]; then\n'
+                    '  echo "  --unix-socket string"\n'
+                    'fi\n'
                 )
                 dispatcher.chmod(0o755)
                 launcher = launcher_dir / "rclone"
@@ -294,7 +314,7 @@ printf '%s' "$RCLONE_BIN"
                 if path_entry == "absolute":
                     self.assertEqual(result.stdout, str(launcher))
                 self.assertEqual((root / "calls").read_text().splitlines(),
-                                 ["version", "mount --help", "mount --help"])
+                                 ["version", "mount --help", "rc --help", "mount --help"])
 
     def test_installer_success_without_binary_is_rejected(self):
         result, _ = self.run_shell("ensure_rclone", CREATE_BINARY="no")
