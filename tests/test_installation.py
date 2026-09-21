@@ -39,14 +39,50 @@ dpkg-query() {
 }
 curl() {
     printf 'curl %s\n' "$*" >> "$STATE/events"
-    while [[ "$1" != --output ]]; do shift; done
-    printf 'downloaded content\n' > "$2"
-    return "$DOWNLOAD_STATUS"
+    local output= url= hash filename
+    while [[ "$#" -gt 0 ]]; do
+        if [[ "$1" == --output ]]; then
+            output=$2; shift 2
+        else
+            url=$1; shift
+        fi
+    done
+    [[ "$DOWNLOAD_STATUS" == 0 ]] || return "$DOWNLOAD_STATUS"
+    case "$url" in
+        */version.txt) printf '%s\n' "$VERSION_TEXT" > "$output" ;;
+        */SHA256SUMS)
+            filename=$(<"$STATE/package-name")
+            hash=$(printf 'downloaded package\n' | sha256sum)
+            hash=${hash%% *}
+            [[ "$CHECKSUM_STATUS" == good ]] || hash=$(printf '%064d' 0)
+            printf '%s  %s\n' "$hash" "$filename" > "$output"
+            ;;
+        *.deb|*.rpm)
+            printf 'downloaded package\n' > "$output"
+            printf '%s' "${url##*/}" > "$STATE/package-name"
+            ;;
+        *) printf 'downloaded script\n' > "$output" ;;
+    esac
 }
 wget() {
     printf 'wget %s\n' "$*" >> "$STATE/events"
-    printf 'downloaded content\n' > "${1#--output-document=}"
-    return "$DOWNLOAD_STATUS"
+    local output=${1#--output-document=} url=$2 hash filename
+    [[ "$DOWNLOAD_STATUS" == 0 ]] || return "$DOWNLOAD_STATUS"
+    case "$url" in
+        */version.txt) printf '%s\n' "$VERSION_TEXT" > "$output" ;;
+        */SHA256SUMS)
+            filename=$(<"$STATE/package-name")
+            hash=$(printf 'downloaded package\n' | sha256sum)
+            hash=${hash%% *}
+            [[ "$CHECKSUM_STATUS" == good ]] || hash=$(printf '%064d' 0)
+            printf '%s  %s\n' "$hash" "$filename" > "$output"
+            ;;
+        *.deb|*.rpm)
+            printf 'downloaded package\n' > "$output"
+            printf '%s' "${url##*/}" > "$STATE/package-name"
+            ;;
+        *) printf 'downloaded script\n' > "$output" ;;
+    esac
 }
 sudo() {
     printf 'sudo %s\n' "$*" >> "$STATE/events"
@@ -78,6 +114,8 @@ class InstallationTests(unittest.TestCase):
                        TMPDIR=str(root / "tmp"), DISTRO="ubuntu debian",
                        AVAILABLE="apt dpkg sudo curl", ARCH="amd64",
                        DOWNLOAD_STATUS="0", INSTALL_STATUS="0",
+                       CHECKSUM_STATUS="good",
+                       VERSION_TEXT="rclone v1.75.1",
                        PACKAGE_INSTALLED="no", EXISTING="no",
                        CREATE_BINARY="yes", VERSION_STATUS="0", MOUNT_STATUS="0")
             env.update(overrides)
@@ -118,17 +156,32 @@ class InstallationTests(unittest.TestCase):
 
     def test_native_package_installation(self):
         for distro, tools, arch, manager, filename in [
-            ("debian", "apt dpkg", "amd64", "apt", "rclone-current-linux-amd64.deb"),
-            ("fedora", "dnf rpm", "aarch64", "dnf", "rclone-current-linux-arm64.rpm"),
-            ("opensuse", "zypper rpm", "x86_64", "zypper", "rclone-current-linux-amd64.rpm"),
+            ("debian", "apt dpkg", "amd64", "apt", "rclone-v1.75.1-linux-amd64.deb"),
+            ("fedora", "dnf rpm", "aarch64", "dnf", "rclone-v1.75.1-linux-arm64.rpm"),
+            ("opensuse", "zypper rpm", "x86_64", "zypper", "rclone-v1.75.1-linux-amd64.rpm"),
         ]:
             with self.subTest(manager=manager):
                 result, events = self.run_shell("ensure_rclone", DISTRO=distro,
                                                 AVAILABLE=tools + " sudo curl", ARCH=arch)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("https://downloads.rclone.org/" + filename, events)
+                self.assertIn("https://downloads.rclone.org/v1.75.1/" + filename, events)
+                self.assertIn("https://downloads.rclone.org/v1.75.1/SHA256SUMS", events)
                 self.assertIn("sudo " + manager + " install ", events)
                 self.assertNotIn("sudo bash", events)
+
+    def test_checksum_failure_never_installs_package(self):
+        result, events = self.run_shell("install_rclone", CHECKSUM_STATUS="bad")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHA-256 verification failed", result.stderr)
+        self.assertNotIn("sudo apt install", events)
+
+    def test_invalid_release_version_never_downloads_or_installs_package(self):
+        result, events = self.run_shell(
+            "install_rclone", VERSION_TEXT="rclone v1.75.1/../../payload")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid Rclone release version", result.stderr)
+        self.assertNotIn("SHA256SUMS", events)
+        self.assertNotIn("sudo apt install", events)
 
     def test_wget_without_curl(self):
         result, events = self.run_shell("install_rclone", AVAILABLE="apt dpkg sudo wget")
